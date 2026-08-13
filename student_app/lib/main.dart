@@ -12,7 +12,12 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await dotenv.load(fileName: ".env");
+
+  try {
+    await dotenv.load(fileName: ".env");
+  } catch (e) {
+    debugPrint('dotenv load failed: $e');
+  }
 
   final supabaseUrl = dotenv.env['Api_url'] ?? '';
   final supabaseAnonKey = dotenv.env['Anon_key'] ?? '';
@@ -24,7 +29,12 @@ Future<void> main() async {
     debugPrint('Firebase initialization failed: $e');
   }
 
-  await Supabase.initialize(url: supabaseUrl, anonKey: supabaseAnonKey);
+  try {
+    await Supabase.initialize(url: supabaseUrl, anonKey: supabaseAnonKey);
+  } catch (e) {
+    debugPrint('Supabase initialization failed: $e');
+  }
+
   runApp(const StudentApp());
 }
 
