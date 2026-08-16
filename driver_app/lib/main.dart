@@ -4,6 +4,25 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
+
+class StopInfo {
+  final String id;
+  final String name;
+  final double lat;
+  final double lon;
+  final int membersCount;
+  StopInfo({
+    required this.id,
+    required this.name,
+    required this.lat,
+    required this.lon,
+    this.membersCount = 0,
+  });
+}
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
@@ -52,11 +71,52 @@ class MyApp extends StatelessWidget {
   }
 }
 
-class AuthGate extends StatelessWidget {
+class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
 
   @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  bool _checking = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _validateSession();
+  }
+
+  Future<void> _validateSession() async {
+    final supabase = Supabase.instance.client;
+    final session = supabase.auth.currentSession;
+    if (session != null) {
+      final user = supabase.auth.currentUser;
+      if (user != null) {
+        final profile = await supabase
+            .from('users')
+            .select('id')
+            .eq('id', user.id)
+            .maybeSingle();
+        if (profile == null) {
+          await supabase.auth.signOut();
+        }
+      } else {
+        await supabase.auth.signOut();
+      }
+    }
+    if (mounted) {
+      setState(() => _checking = false);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (_checking) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
     final session = Supabase.instance.client.auth.currentSession;
     if (session != null) {
       return const TripDashboardScreen();
@@ -74,89 +134,198 @@ class AuthScreen extends StatefulWidget {
 
 class _AuthScreenState extends State<AuthScreen> {
   final _nameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
   final _busNumberController = TextEditingController();
   final _phoneController = TextEditingController();
 
   bool _isLoading = false;
+  bool _isSignUp = true;
+  String? _errorMessage;
 
   final _supabase = Supabase.instance.client;
 
-  Future<void> _enterAsDriver() async {
-    final name = _nameController.text.trim();
-    final busNumber = _busNumberController.text.trim();
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _emailController.dispose();
+    _passwordController.dispose();
+    _busNumberController.dispose();
+    _phoneController.dispose();
+    super.dispose();
+  }
 
-    if (name.isEmpty || busNumber.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter your name and bus number.')),
-      );
+  Future<void> _submit() async {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+
+    if (email.isEmpty || password.isEmpty) {
+      setState(() => _errorMessage = 'Please enter email and password.');
       return;
     }
 
-    setState(() => _isLoading = true);
-    try {
-      // 1. Sign in anonymously — no email, no OTP needed
-      final response = await _supabase.auth.signInAnonymously();
-      final user = response.user;
-      if (user == null) throw Exception('Anonymous sign-in failed');
+    if (_isSignUp) {
+      final name = _nameController.text.trim();
+      final busNumber = _busNumberController.text.trim();
 
-      // 2. Validate bus number exists
-      final busResponse = await _supabase
-          .from('buses')
-          .select('id')
-          .eq('bus_number', busNumber)
-          .maybeSingle();
-
-      if (busResponse == null) {
-        await _supabase.auth.signOut();
-        throw Exception('Bus "$busNumber" not found — ask admin to add it first.');
+      if (name.isEmpty || busNumber.isEmpty) {
+        setState(() => _errorMessage = 'Please fill in all required fields.');
+        return;
       }
+      if (password.length < 6) {
+        setState(() => _errorMessage = 'Password must be at least 6 characters.');
+        return;
+      }
+    }
 
-      final busId = busResponse['id'] as String;
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
 
-      // 3. Insert driver profile
-      await _supabase.from('users').insert({
-        'id': user.id,
-        'name': name,
-        'phone': _phoneController.text.trim().isEmpty
-            ? null
-            : _phoneController.text.trim(),
-        'role': 'driver',
-      });
-
-      // 4. Assign driver to bus
-      await _supabase.from('driver_bus_assignments').insert({
-        'driver_id': user.id,
-        'bus_id': busId,
-      });
-
-      if (mounted) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const TripDashboardScreen()),
-        );
+    try {
+      if (_isSignUp) {
+        await _signUp();
+      } else {
+        await _signIn();
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: ${e.toString()}')),
-        );
+        setState(() => _errorMessage = e.toString());
       }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
   }
 
-  @override
-  void dispose() {
-    _nameController.dispose();
-    _busNumberController.dispose();
-    _phoneController.dispose();
-    super.dispose();
+  Future<void> _signUp() async {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    final name = _nameController.text.trim();
+    final busNumber = _busNumberController.text.trim();
+
+    try {
+      final response = await _supabase.auth.signUp(
+        email: email,
+        password: password,
+      );
+
+      final user = response.user;
+      if (user == null) throw Exception('Sign up failed');
+
+      // If Supabase has email confirmation enabled, session will be null
+      if (response.session == null) {
+        if (mounted) {
+          setState(() {
+            _errorMessage = null;
+            _isLoading = false;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Check your email for a confirmation link, then sign in.'),
+              backgroundColor: Color(0xFF22C55E),
+              duration: Duration(seconds: 5),
+            ),
+          );
+          // Switch to sign-in mode
+          setState(() => _isSignUp = false);
+        }
+        return;
+      }
+
+      // Session exists (email confirmation disabled) - complete setup
+      await _completeDriverSetup(user.id, name, busNumber);
+    } catch (e) {
+      // If auth user already exists but profile was deleted, recover by
+      // signing in and recreating the profile + bus assignment.
+      final msg = e.toString();
+      if (msg.contains('already') || msg.contains('registered')) {
+        final signInResp = await _supabase.auth.signInWithPassword(
+          email: email,
+          password: password,
+        );
+        final user = signInResp.user;
+        if (user == null) throw Exception('Sign up failed. Email already in use but sign-in also failed. Try signing in instead.');
+        await _completeDriverSetup(user.id, name, busNumber);
+        return;
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _signIn() async {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+
+    final response = await _supabase.auth.signInWithPassword(
+      email: email,
+      password: password,
+    );
+
+    final user = response.user;
+    if (user == null) throw Exception('Sign in failed');
+
+    // Fetch existing driver profile
+    final profile = await _supabase
+        .from('users')
+        .select('name')
+        .eq('id', user.id)
+        .maybeSingle();
+
+    if (profile == null) {
+      await _supabase.auth.signOut();
+      throw Exception('No driver profile found. Please sign up again with the same email.');
+    }
+
+    if (mounted) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const TripDashboardScreen()),
+      );
+    }
+  }
+
+  Future<void> _completeDriverSetup(String userId, String name, String busNumber) async {
+    // 1. Validate bus number exists
+    final busResponse = await _supabase
+        .from('buses')
+        .select('id')
+        .eq('bus_number', busNumber)
+        .maybeSingle();
+
+    if (busResponse == null) {
+      await _supabase.auth.signOut();
+      throw Exception('Bus "$busNumber" not found. Ask admin to add it first.');
+    }
+
+    final busId = busResponse['id'] as String;
+
+    // 2. Insert driver profile
+    await _supabase.from('users').upsert({
+      'id': userId,
+      'name': name,
+      'phone': _phoneController.text.trim().isEmpty
+          ? null
+          : _phoneController.text.trim(),
+      'role': 'driver',
+    });
+
+    // 3. Assign driver to bus
+    await _supabase.from('driver_bus_assignments').upsert({
+      'driver_id': userId,
+      'bus_id': busId,
+    });
+
+    if (mounted) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const TripDashboardScreen()),
+      );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Driver Sign Up')),
+      appBar: AppBar(title: Text(_isSignUp ? 'Driver Sign Up' : 'Driver Sign In')),
       body: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
@@ -164,38 +333,86 @@ class _AuthScreenState extends State<AuthScreen> {
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              TextField(
-                controller: _nameController,
-                decoration: const InputDecoration(labelText: 'Full Name'),
-                textCapitalization: TextCapitalization.words,
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _busNumberController,
-                decoration: const InputDecoration(
-                  labelText: 'Bus Number (e.g. 4)',
-                  hintText: 'Must match system record',
+              if (_isSignUp) ...[
+                TextField(
+                  controller: _nameController,
+                  decoration: const InputDecoration(labelText: 'Full Name *'),
+                  textCapitalization: TextCapitalization.words,
                 ),
-                keyboardType: TextInputType.number,
+                const SizedBox(height: 12),
+              ],
+              TextField(
+                controller: _emailController,
+                decoration: const InputDecoration(labelText: 'Email *'),
+                keyboardType: TextInputType.emailAddress,
               ),
               const SizedBox(height: 12),
               TextField(
-                controller: _phoneController,
-                decoration: const InputDecoration(labelText: 'Phone Number (Optional)'),
-                keyboardType: TextInputType.phone,
+                controller: _passwordController,
+                decoration: const InputDecoration(labelText: 'Password *'),
+                obscureText: true,
               ),
-              const SizedBox(height: 32),
+              if (_isSignUp) ...[
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _busNumberController,
+                  decoration: const InputDecoration(
+                    labelText: 'Bus Number *',
+                    hintText: 'e.g. 1, 2, 3...',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _phoneController,
+                  decoration: const InputDecoration(labelText: 'Phone (Optional)'),
+                  keyboardType: TextInputType.phone,
+                ),
+              ],
+              const SizedBox(height: 24),
+
+              // Error message
+              if (_errorMessage != null)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  margin: const EdgeInsets.only(bottom: 16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEF4444).withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFEF4444).withValues(alpha: 0.3)),
+                  ),
+                  child: Text(
+                    _errorMessage!,
+                    style: const TextStyle(color: Color(0xFFEF4444), fontSize: 14),
+                  ),
+                ),
+
               ElevatedButton(
-                onPressed: _isLoading ? null : _enterAsDriver,
+                onPressed: _isLoading ? null : _submit,
                 style: ElevatedButton.styleFrom(
                   padding: const EdgeInsets.symmetric(vertical: 18),
                 ),
                 child: _isLoading
                     ? const CircularProgressIndicator()
-                    : const Text(
-                        'Enter as Driver',
-                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    : Text(
+                        _isSignUp ? 'Create Account & Enter' : 'Sign In',
+                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                       ),
+              ),
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: _isLoading
+                    ? null
+                    : () => setState(() {
+                          _isSignUp = !_isSignUp;
+                          _errorMessage = null;
+                        }),
+                child: Text(
+                  _isSignUp
+                      ? 'Already have an account? Sign In'
+                      : "Don't have an account? Sign Up",
+                  style: const TextStyle(color: Color(0xFF94A3B8)),
+                ),
               ),
             ],
           ),
@@ -219,12 +436,19 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
   String? _busId;
   String? _busNumber;
   String? _routeId;
+  String? _driverName;
   
   String? _activeTripId;
   bool _isTracking = false;
   StreamSubscription<Position>? _positionSubscription;
   RealtimeChannel? _arrivalChannel;
   final Set<String> _handledArrivalIds = {};
+
+  WebViewController? _webViewController;
+  bool _mapReady = false;
+  bool _busMarkerAddedToMap = false;
+  List<StopInfo> _stops = [];
+  Position? _lastPosition;
 
   @override
   void initState() {
@@ -236,6 +460,17 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
     try {
       final user = _supabase.auth.currentUser;
       if (user == null) return;
+
+      // 0. Fetch driver profile from users table
+      final userProfile = await _supabase
+          .from('users')
+          .select('name')
+          .eq('id', user.id)
+          .maybeSingle();
+
+      if (userProfile != null) {
+        _driverName = userProfile['name'] as String;
+      }
 
       // 1. Fetch assigned bus for current driver
       final assignment = await _supabase
@@ -266,9 +501,15 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
             _activeTripId = tripId;
             _isTracking = true;
           });
+          _initWebView();
+          _loadRouteStops();
           // Resume tracking if trip was in_progress
           _startLocationUpdates();
           _subscribeToArrivals();
+        } else {
+          // No active trip - still init map to show driver location
+          _initWebView();
+          if (_routeId != null) _loadRouteStops();
         }
       }
     } catch (e) {
@@ -285,12 +526,21 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
   }
 
   Future<void> _startLocationUpdates() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      throw Exception('Location services are turned off on this device.');
+    }
+
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) return;
+      if (permission == LocationPermission.denied) {
+        throw Exception('Location permission was denied.');
+      }
     }
-    if (permission == LocationPermission.deniedForever) return;
+    if (permission == LocationPermission.deniedForever) {
+      throw Exception('Location permission is permanently denied for this app.');
+    }
 
     // Request notification permission on Android 13+
     await flutterLocalNotificationsPlugin
@@ -310,6 +560,33 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
       ),
     ).listen((Position position) async {
       if (!_isTracking || _activeTripId == null) return;
+
+      if (mounted) {
+        setState(() {
+          _lastPosition = position;
+        });
+      }
+      if (_mapReady && _webViewController != null) {
+        if (!_busMarkerAddedToMap && _busNumber != null) {
+          _sendToMap(_enc({
+            'type': 'addBus',
+            'id': _activeTripId!,
+            'lat': position.latitude,
+            'lon': position.longitude,
+            'busNumber': _busNumber!,
+            'status': 'on_time',
+          }));
+          _busMarkerAddedToMap = true;
+          _sendToMap(_enc({'type': 'flyToBus', 'id': _activeTripId!}));
+        } else {
+          _sendToMap(_enc({
+            'type': 'updateBusPosition',
+            'id': _activeTripId!,
+            'lat': position.latitude,
+            'lon': position.longitude,
+          }));
+        }
+      }
 
       try {
         await _supabase.from('location_pings').insert({
@@ -546,6 +823,135 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
     _handledArrivalIds.clear();
   }
 
+  void _initWebView() {
+    final cesiumToken = dotenv.env['CESIUM_ION_ACCESS_TOKEN'] ?? '';
+    _busMarkerAddedToMap = false;
+    _webViewController = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..addJavaScriptChannel(
+        'Flutter',
+        onMessageReceived: (JavaScriptMessage msg) {
+          if (msg.message.contains('"type":"ready"')) {
+            setState(() {
+              _mapReady = true;
+            });
+            _syncRouteAndLocationToMap();
+          }
+        },
+      )
+      ..setNavigationDelegate(NavigationDelegate(
+        onPageFinished: (_) {
+          final escapedToken = cesiumToken.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
+          final initMsg = '{"type":"init","token":"$escapedToken"}';
+          _webViewController!.runJavaScript("handleMessage($initMsg)");
+        },
+      ));
+
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      final androidController = _webViewController!.platform as AndroidWebViewController;
+      androidController.setMixedContentMode(MixedContentMode.alwaysAllow);
+      androidController.setAllowFileAccess(true);
+      androidController.setAllowContentAccess(true);
+    }
+
+    _loadCesiumHtml();
+  }
+
+  Future<void> _loadCesiumHtml() async {
+    try {
+      final htmlContent = await rootBundle.loadString('web/cesium/map.html');
+      await _webViewController!.loadHtmlString(htmlContent, baseUrl: 'https://localhost');
+    } catch (e) {
+      debugPrint('Failed to load Cesium HTML: $e');
+      await _webViewController!.loadFlutterAsset('web/cesium/map.html');
+    }
+  }
+
+  void _sendToMap(String json) {
+    if (_webViewController == null || !_mapReady) return;
+    try {
+      _webViewController!.runJavaScript("handleMessage($json)");
+    } catch (e) {
+      debugPrint('Error sending to map: $e');
+    }
+  }
+
+  String _enc(Map<String, dynamic> map) {
+    final parts = <String>[];
+    for (final e in map.entries) {
+      final v = e.value;
+      if (v is String) {
+        parts.add('"${e.key}":"${v.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"');
+      } else {
+        parts.add('"${e.key}":$v');
+      }
+    }
+    return '{${parts.join(',')}}';
+  }
+
+  Future<void> _loadRouteStops() async {
+    if (_routeId == null) return;
+    try {
+      final data = await _supabase
+          .from('stops')
+          .select('id, name, lat, lon')
+          .eq('route_id', _routeId!)
+          .order('sequence_no');
+      
+      setState(() {
+        _stops = (data as List).map((s) => StopInfo(
+          id: s['id'] as String,
+          name: s['name'] as String,
+          lat: (s['lat'] as num).toDouble(),
+          lon: (s['lon'] as num).toDouble(),
+          membersCount: 0,
+        )).toList();
+      });
+      
+      _syncRouteAndLocationToMap();
+    } catch (e) {
+      debugPrint('Failed to load stops: $e');
+    }
+  }
+
+  void _syncRouteAndLocationToMap() {
+    if (!_mapReady || _webViewController == null) return;
+    
+    for (final stop in _stops) {
+      _sendToMap(_enc({
+        'type': 'addStop',
+        'id': stop.id,
+        'lat': stop.lat,
+        'lon': stop.lon,
+        'name': stop.name,
+        'membersCount': stop.membersCount,
+      }));
+    }
+
+    if (_stops.isNotEmpty && _lastPosition == null && !_isTracking) {
+      _sendToMap(_enc({'type': 'flyToStops'}));
+    }
+
+    if (_lastPosition != null && _busNumber != null && _activeTripId != null) {
+      _sendToMap(_enc({
+        'type': 'addBus',
+        'id': _activeTripId!,
+        'lat': _lastPosition!.latitude,
+        'lon': _lastPosition!.longitude,
+        'busNumber': _busNumber!,
+        'status': 'on_time',
+      }));
+      _busMarkerAddedToMap = true;
+      _sendToMap(_enc({
+        'type': 'flyToBus',
+        'id': _activeTripId!,
+      }));
+    } else if (!_isTracking) {
+      // No active trip - auto-locate driver
+      _locateMe();
+    }
+  }
+
   Future<void> _startTrip() async {
     if (_busId == null || _routeId == null) return;
 
@@ -569,7 +975,11 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
       setState(() {
         _activeTripId = tripId;
         _isTracking = true;
+        _lastPosition = null;
       });
+
+      _initWebView();
+      _loadRouteStops();
 
       // 2. Activate background geolocation stream
       await _startLocationUpdates();
@@ -613,6 +1023,11 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
       setState(() {
         _activeTripId = null;
         _isTracking = false;
+        _mapReady = false;
+        _busMarkerAddedToMap = false;
+        _webViewController = null;
+        _stops.clear();
+        _lastPosition = null;
       });
 
       if (mounted) {
@@ -636,6 +1051,28 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
     _positionSubscription?.cancel();
     _arrivalChannel?.unsubscribe();
     super.dispose();
+  }
+
+  Future<void> _locateMe() async {
+    try {
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) return;
+      }
+      if (permission == LocationPermission.deniedForever) return;
+
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      );
+      _sendToMap(_enc({
+        'type': 'flyToLocation',
+        'lat': position.latitude,
+        'lon': position.longitude,
+      }));
+    } catch (e) {
+      debugPrint('Driver locate me failed: $e');
+    }
   }
 
   @override
@@ -664,7 +1101,6 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
           : Padding(
               padding: const EdgeInsets.all(24.0),
               child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Card(
@@ -675,7 +1111,7 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Driver: ${user?.email ?? "Unknown"}',
+                            'Driver: ${_driverName ?? "Unknown"}',
                             style: Theme.of(context).textTheme.titleMedium,
                           ),
                           const SizedBox(height: 8),
@@ -690,7 +1126,48 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(height: 48),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Stack(
+                        children: [
+                          if (_webViewController != null)
+                            WebViewWidget(controller: _webViewController!)
+                          else
+                            const Center(child: CircularProgressIndicator()),
+                          Positioned(
+                            bottom: 16,
+                            right: 16,
+                            child: GestureDetector(
+                              onTap: _locateMe,
+                              child: Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF1E293B).withValues(alpha: 0.9),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: const Color(0xFF334155)),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: Colors.black.withValues(alpha: 0.3),
+                                      blurRadius: 8,
+                                      offset: const Offset(0, 2),
+                                    ),
+                                  ],
+                                ),
+                                child: const Icon(
+                                  Icons.my_location,
+                                  color: Color(0xFF6366F1),
+                                  size: 22,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   if (!_isTracking) ...[
                     ElevatedButton.icon(
                       icon: const Icon(Icons.play_arrow),

@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cesium Bus Tracker</title>
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Cesium.js"></script>
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <style>
+        html, body, #cesiumContainer {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #0F172A;
+        }
+        #cesiumContainer { position: relative; }
+        #error-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #0F172A; display: none; align-items: center;
+            justify-content: center; z-index: 2000; flex-direction: column;
+        }
+        #error-overlay .msg { color: #EF4444; font-family: sans-serif; font-size: 14px; margin-top: 12px; }
+        #error-overlay .retry { color: #6366F1; font-family: sans-serif; font-size: 13px; margin-top: 8px; cursor: pointer; text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div id="cesiumContainer"></div>
+    <div id="error-overlay">
+        <div class="msg">Failed to load Cesium Ion map.</div>
+        <div class="retry" onclick="retryInit()">Tap to retry</div>
+    </div>
+
+    <script>
+        var viewer = null;
+        var busEntities = {};
+        var stopEntities = {};
+        var trackedBusId = null;
+        var initToken = '';
+        var initAttempted = false;
+        var cesiumReady = false;
+
+        // Polyfill for roundRect if not supported
+        if (!CanvasRenderingContext2D.prototype.roundRect) {
+            CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+                if (w < 2 * r) r = w / 2;
+                if (h < 2 * r) r = h / 2;
+                this.beginPath();
+                this.moveTo(x+r, y);
+                this.arcTo(x+w, y,   x+w, y+h, r);
+                this.arcTo(x+w, y+h, x,   y+h, r);
+                this.arcTo(x,   y+h, x,   y,   r);
+                this.arcTo(x,   y,   x+w, y,   r);
+                this.closePath();
+                return this;
+            }
+        }
+
+        function notifyFlutter(msg) {
+            try {
+                if (typeof Flutter !== 'undefined' && Flutter.postMessage) {
+                    Flutter.postMessage(msg);
+                }
+            } catch(e) {}
+        }
+
+        function isCesiumAvailable() {
+            return typeof Cesium !== 'undefined' && typeof Cesium.Viewer === 'function';
+        }
+
+        function waitForCesium(timeout) {
+            timeout = timeout || 15000;
+            return new Promise(function(resolve, reject) {
+                if (isCesiumAvailable()) {
+                    resolve();
+                    return;
+                }
+                var start = Date.now();
+                var interval = setInterval(function() {
+                    if (isCesiumAvailable()) {
+                        clearInterval(interval);
+                        cesiumReady = true;
+                        resolve();
+                    } else if (Date.now() - start > timeout) {
+                        clearInterval(interval);
+                        reject(new Error('CesiumJS failed to load from CDN after ' + timeout + 'ms'));
+                    }
+                }, 200);
+            });
+        }
+
+        async function initCesium(token) {
+            if (initAttempted) return;
+            initAttempted = true;
+            initToken = token;
+
+            try {
+                // Wait for CesiumJS to be available (CDN script may still be loading)
+                await waitForCesium(15000);
+                console.log('CesiumJS library loaded successfully');
+
+                // Set Cesium Ion token if provided
+                if (token && token.length > 10) {
+                    Cesium.Ion.defaultAccessToken = token;
+                    console.log('Using Cesium Ion with token');
+                } else {
+                    console.warn('No valid Cesium Ion token, using fallback imagery');
+                }
+
+                // Build imagery provider — try methods in order of reliability
+                var imageryProvider = null;
+
+                // Method 1: Cesium World Imagery via createWorldImageryAsync (correct API for Ion tokens)
+                if (token && token.length > 10) {
+                    try {
+                        imageryProvider = await Cesium.createWorldImageryAsync();
+                        console.log('Using Cesium World Imagery (createWorldImageryAsync)');
+                    } catch (e1) {
+                        console.warn('createWorldImageryAsync failed:', e1.message);
+
+                        // Method 2: IonImageryProvider with asset 2 (Bing Maps Aerial) — more widely available on Ion accounts
+                        try {
+                            imageryProvider = await Cesium.IonImageryProvider.fromAssetId(2);
+                            console.log('Using Ion asset 2 (Bing Maps Aerial)');
+                        } catch (e2) {
+                            console.warn('Ion asset 2 failed:', e2.message);
+
+                            // Method 3: ArcGIS World Imagery — CORS-friendly, no auth needed
+                            try {
+                                imageryProvider = await Cesium.ArcGisMapServerImageryProvider.fromUrl(
+                                    'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer'
+                                );
+                                console.log('Using ArcGIS World Imagery fallback');
+                            } catch (e3) {
+                                console.warn('ArcGIS fallback failed:', e3.message);
+                                imageryProvider = null;
+                            }
+                        }
+                    }
+                } else {
+                    // No token — go straight to ArcGIS fallback
+                    try {
+                        imageryProvider = await Cesium.ArcGisMapServerImageryProvider.fromUrl(
+                            'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer'
+                        );
+                        console.log('Using ArcGIS World Imagery (no Ion token)');
+                    } catch (e) {
+                        console.warn('ArcGIS fallback failed (no token):', e.message);
+                    }
+                }
+
+                var viewerOptions = {
+                    baseLayerPicker: false,
+                    geocoder: false,
+                    homeButton: false,
+                    sceneModePicker: false,
+                    navigationHelpButton: false,
+                    animation: false,
+                    timeline: false,
+                    fullscreenButton: false,
+                    vrButton: false,
+                    selectionIndicator: false,
+                    infoBox: false,
+                    // Continuous rendering ensures tiles paint as soon as they load
+                    requestRenderMode: false,
+                    contextOptions: {
+                        webgl: { alpha: false }
+                    }
+                };
+
+                // Only pass baseLayer if we have a valid provider
+                if (imageryProvider) {
+                    viewerOptions.baseLayer = new Cesium.ImageryLayer(imageryProvider);
+                } else {
+                    viewerOptions.baseLayer = false; // Disable default imagery
+                }
+
+                viewer = new Cesium.Viewer('cesiumContainer', viewerOptions);
+
+                // Handle clicks on map features (like bus entities)
+                var handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+                handler.setInputAction(function(click) {
+                    var pickedObject = viewer.scene.pick(click.position);
+                    if (Cesium.defined(pickedObject) && pickedObject.id) {
+                        var entityId = pickedObject.id.id;
+                        // Check if it's a bus entity
+                        if (busEntities[entityId]) {
+                            notifyFlutter(JSON.stringify({
+                                type: 'clickBus',
+                                id: entityId
+                            }));
+                        }
+                    }
+                }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+                viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#0F172A');
+                viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#1E293B');
+                viewer.scene.globe.enableLighting = false;
+
+                // Disable fog for better visibility
+                viewer.scene.fog.enabled = false;
+                viewer.scene.fog.density = 0;
+
+                // Set initial camera position (Bangalore, India as default)
+                // Use straight-down (top-down 2D) view at ~50 km altitude for a proper street map look
+                viewer.camera.setView({
+                    destination: Cesium.Cartesian3.fromDegrees(77.5946, 12.9716, 50000),
+                    orientation: {
+                        heading: 0.0,
+                        pitch: -Cesium.Math.PI_OVER_TWO, // straight down (-90°)
+                        roll: 0.0
+                    }
+                });
+
+                // Re-render when imagery layers update
+                viewer.scene.globe.imageryLayersUpdatedEvent.addEventListener(function() {
+                    viewer.scene.requestRender();
+                });
+
+                // Force an initial render so the globe is visible immediately
+                viewer.scene.requestRender();
+
+                console.log('Cesium viewer created successfully');
+                notifyFlutter(JSON.stringify({type: 'ready'}));
+
+            } catch(e) {
+                console.error('Cesium init error:', e);
+                // Notify Flutter so the app does not hang
+                notifyFlutter(JSON.stringify({type: 'ready'}));
+                document.getElementById('error-overlay').style.display = 'flex';
+                var msgEl = document.querySelector('#error-overlay .msg');
+                if (msgEl) {
+                    msgEl.textContent = 'Failed to load map: ' + (e.message || 'Unknown error');
+                }
+            }
+        }
+
+        async function retryInit() {
+            document.getElementById('error-overlay').style.display = 'none';
+            initAttempted = false;
+            if (initToken) {
+                await initCesium(initToken);
+            }
+        }
+
+        function addBusMarker(id, lat, lon, busNumber, status) {
+            if (!viewer) return;
+            if (busEntities[id]) {
+                try { viewer.entities.remove(busEntities[id]); } catch(e) {}
+            }
+            var colorMap = {
+                'on_time': new Cesium.Color(0.388, 0.4, 0.945, 1.0),     // Blue
+                'late': new Cesium.Color(0.937, 0.267, 0.267, 1.0),      // Red
+                'arrived': new Cesium.Color(0.133, 0.773, 0.369, 1.0),   // Green
+                'stopped': new Cesium.Color(0.854, 0.647, 0.125, 1.0)    // Yellow
+            };
+            var color = colorMap[status] || colorMap['on_time'];
+            
+            var entity = viewer.entities.add({
+                id: id,
+                position: Cesium.Cartesian3.fromDegrees(lon, lat),
+                billboard: {
+                    image: createBusIcon(color, busNumber),
+                    scale: 1.0,
+                    verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                    heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                    disableDepthTestDistance: Number.POSITIVE_INFINITY
+                },
+                point: {
+                    pixelSize: 16,
+                    color: color,
+                    outlineColor: Cesium.Color.WHITE,
+                    outlineWidth: 3,
+                    heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                    disableDepthTestDistance: Number.POSITIVE_INFINITY
+                }
+            });
+            busEntities[id] = entity;
+            viewer.scene.requestRender();
+        }
+
+        function createBusIcon(color, busNumber) {
+            var canvas = document.createElement('canvas');
+            canvas.width = 40;
+            canvas.height = 40;
+            var ctx = canvas.getContext('2d');
+            
+            // Draw bus icon background
+            ctx.fillStyle = `rgb(${Math.floor(color.red * 255)}, ${Math.floor(color.green * 255)}, ${Math.floor(color.blue * 255)})`;
+            ctx.beginPath();
+            ctx.roundRect(5, 10, 30, 20, 4);
+            ctx.fill();
+            
+            // Draw white outline
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            
+            // Draw bus number
+            ctx.fillStyle = 'white';
+            ctx.font = 'bold 10px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(busNumber, 20, 22);
+            
+            return canvas;
+        }
+
+        function updateBusMarker(id, lat, lon) {
+            if (!viewer || !busEntities[id]) return;
+            busEntities[id].position = Cesium.Cartesian3.fromDegrees(lon, lat);
+            // If this bus is being tracked, follow with camera
+            if (trackedBusId === id) {
+                viewer.camera.flyTo({
+                    destination: Cesium.Cartesian3.fromDegrees(lon, lat, 2000),
+                    offset: new Cesium.HeadingPitchRange(0, -Cesium.Math.PI_OVER_FOUR, 2000),
+                    duration: 0.5
+                });
+            }
+            viewer.scene.requestRender();
+        }
+
+        function updateBusStatus(id, status) {
+            if (!viewer || !busEntities[id]) return;
+            var colorMap = {
+                'on_time': new Cesium.Color(0.388, 0.4, 0.945, 1.0),
+                'late': new Cesium.Color(0.937, 0.267, 0.267, 1.0),
+                'arrived': new Cesium.Color(0.133, 0.773, 0.369, 1.0),
+                'stopped': new Cesium.Color(0.854, 0.647, 0.125, 1.0)
+            };
+            var color = colorMap[status] || colorMap['on_time'];
+            busEntities[id].point.color = color;
+            
+            // Update billboard if it exists
+            if (busEntities[id].billboard) {
+                var busNumber = busEntities[id].label ? busEntities[id].label.text._value : 'BUS';
+                busEntities[id].billboard.image = createBusIcon(color, busNumber);
+            }
+            viewer.scene.requestRender();
+        }
+
+        function removeBusMarker(id) {
+            if (!viewer || !busEntities[id]) return;
+            try { viewer.entities.remove(busEntities[id]); } catch(e) {}
+            delete busEntities[id];
+        }
+
+        function addStopMarker(id, lat, lon, name, membersCount) {
+            if (!viewer) return;
+            if (stopEntities[id]) {
+                try { viewer.entities.remove(stopEntities[id]); } catch(e) {}
+            }
+            var labelText = name;
+            if (typeof membersCount !== 'undefined' && membersCount !== null && membersCount > 0) {
+                labelText += ' (' + membersCount + ' waiting)';
+            }
+            var entity = viewer.entities.add({
+                id: id,
+                position: Cesium.Cartesian3.fromDegrees(lon, lat),
+                point: {
+                    pixelSize: 8,
+                    color: Cesium.Color.fromCssColorString('#475569'),
+                    outlineColor: Cesium.Color.fromCssColorString('#94A3B8'),
+                    outlineWidth: 2,
+                    heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                    disableDepthTestDistance: Number.POSITIVE_INFINITY
+                },
+                label: {
+                    text: labelText,
+                    font: 'bold 11px sans-serif',
+                    fillColor: Cesium.Color.WHITE,
+                    outlineColor: Cesium.Color.BLACK,
+                    outlineWidth: 2,
+                    style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                    verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                    pixelOffset: new Cesium.Cartesian2(0, -12),
+                    heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                    disableDepthTestDistance: Number.POSITIVE_INFINITY
+                }
+            });
+            stopEntities[id] = entity;
+        }
+
+        function removeStopMarker(id) {
+            if (!viewer || !stopEntities[id]) return;
+            try { viewer.entities.remove(stopEntities[id]); } catch(e) {}
+            delete stopEntities[id];
+        }
+
+        function flyToBus(id) {
+            if (!viewer || !busEntities[id]) return;
+            var pos = busEntities[id].position.getValue(Cesium.JulianDate.now());
+            if (pos) {
+                viewer.camera.flyTo({
+                    destination: Cesium.Cartesian3.fromCartesian3(pos, Cesium.ReferenceFrame.FIXED),
+                    offset: new Cesium.HeadingPitchRange(0, -Cesium.Math.PI_OVER_FOUR, 3000),
+                    duration: 1.5
+                });
+            }
+        }
+
+        function flyToLocation(lat, lon) {
+            if (!viewer) return;
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromDegrees(lon, lat, 2000),
+                offset: new Cesium.HeadingPitchRange(0, -Cesium.Math.PI_OVER_FOUR, 2000),
+                duration: 1.5
+            });
+        }
+
+        async function handleMessage(msg) {
+            if (typeof msg === 'string') {
+                try { msg = JSON.parse(msg); } catch(e) { return; }
+            }
+            switch(msg.type) {
+                case 'init': await initCesium(msg.token); break;
+                case 'addBus': addBusMarker(msg.id, msg.lat, msg.lon, msg.busNumber, msg.status); break;
+                case 'updateBusPosition': updateBusMarker(msg.id, msg.lat, msg.lon); break;
+                case 'updateBusStatus': updateBusStatus(msg.id, msg.status); break;
+                case 'removeBus': removeBusMarker(msg.id); break;
+                case 'addStop': addStopMarker(msg.id, msg.lat, msg.lon, msg.name, msg.membersCount); break;
+                case 'removeStop': removeStopMarker(msg.id); break;
+                case 'flyToBus': flyToBus(msg.id); break;
+                case 'flyToLocation': flyToLocation(msg.lat, msg.lon); break;
+                case 'trackBus': trackedBusId = msg.id; flyToBus(msg.id); break;
+                case 'untrackBus': trackedBusId = null; break;
+            }
+        }
+    </script>
+</body>
+</html>

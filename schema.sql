@@ -1,11 +1,11 @@
 -- Enable PostGIS extension for geofencing support
 create extension if not exists postgis;
 
--- Users table (stores driver profile details)
+-- Users table (stores driver and student profile details)
 create table users (
   id uuid primary key references auth.users(id),
   name text not null,
-  role text not null default 'driver' check (role in ('driver')),
+  role text not null default 'driver' check (role in ('driver', 'student')),
   phone text,
   created_at timestamptz default now()
 );
