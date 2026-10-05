@@ -1,10 +1,65 @@
-# College Bus Transit & Real-Time Tracking System (FOAI Project) 🚍🎓
+# Multi-Agent Campus Transport Management System (MACTMS) 🚍🎓🤖
 
-An end-to-end college bus tracking, passenger telemetry, and transit intelligence platform consisting of two dedicated Flutter mobile applications backed by **Supabase (PostgreSQL + PostGIS + Realtime + Edge Functions)** and **CesiumJS 3D**.
+An end-to-end **multi-agent** college bus tracking, passenger telemetry, and transit intelligence platform. The system comprises **five autonomous runtime agents** and a **five-agent AI development team** (defined in `opencode.json`), all collaborating through a shared Supabase (PostgreSQL + PostGIS + Realtime + Edge Functions) and CesiumJS 3D backbone.
+
+---
+
+## 🤖 Multi-Agent Architecture
+
+The name **"Multi-Agent"** reflects two distinct layers of agents in this project:
+
+### Layer 1 — Development-Time AI Agents (`opencode.json`)
+
+This project was built using [OpenCode](https://opencode.ai), an AI multi-agent development framework. Rather than a single AI writing all the code, a **team of specialized LLM agents** was orchestrated, each with a distinct expertise:
+
+| Agent | Mode | Model | Responsibility |
+|---|---|---|---|
+| `architect` | Primary | `nemotron-3-ultra` | Designs architecture, orchestrates all other agents, writes high-level specs |
+| `builder` | Subagent | `mimo-v2.5` | Implements Flutter/Dart code, SQL schemas, and pubspec configs |
+| `researcher` | Subagent | `deepseek-v4-flash` | Researches PostGIS APIs, Supabase Realtime, CesiumJS, Flutter plugins |
+| `debugger` | Subagent | `nemotron-3.5-lightning` | Traces runtime issues, validates trigger logic, and tests edge cases |
+| `reviewer` | Subagent | `gpt-oss:120b` | Independent senior code review for security, correctness, and maintainability |
+
+### Layer 2 — Runtime Autonomous Agents (Deployed System)
+
+Once deployed, the system operates as **five autonomous, decoupled agents** that communicate exclusively through database state changes — no agent calls another directly:
+
+| # | Agent | Where it Lives | What Triggers It | What It Does |
+|---|---|---|---|---|
+| 1 | **Telemetry Agent** | `driver_app/` | Human driver taps *Start Trip* | Streams high-frequency GPS coordinates to `bus_positions` every 10 metres |
+| 2 | **Geofence Detection Agent** | `geofence_trigger.sql` (PostGIS) | Every row upserted into `bus_positions` | Runs `ST_DWithin()` against all route stops, fires `arrived`/`departed` events, computes on-time/late status |
+| 3 | **Occupancy Tracking Agent** | `occupancy_trigger.sql` (PL/pgSQL) | Every row inserted into `stop_boardings` | Auto-increments `trips.current_occupancy` — zero app-side logic |
+| 4 | **Notification Dispatch Agent** | `notification_setup.sql` + `send-push` Edge Function | Every `trips.running_status` change | Queries subscribed students' FCM tokens, calls Deno Edge Function, dispatches Firebase push notifications |
+| 5 | **Visualization & Intelligence Agent** | `student_app/` | Supabase Realtime WebSocket events | Renders live 3D Cesium map, computes occupancy load-balancing suggestions, displays proximity arrival alerts |
+
+### How agents communicate — shared event bus
+
+```mermaid
+flowchart LR
+    TA["1 Telemetry Agent\nDriver App"] -->|upserts GPS coords| BP[(bus_positions)]
+    BP -->|PostgreSQL row trigger| GDA["2 Geofence Detection Agent\nPL/pgSQL + PostGIS"]
+    GDA -->|inserts arrived or departed| SE[(stop_events)]
+    GDA -->|updates running_status| TR[(trips)]
+
+    SE -->|Realtime broadcast| DA["Driver App\nHeadcount Modal"]
+    DA -->|inserts boarding count| SB[(stop_boardings)]
+    SB -->|PostgreSQL row trigger| OTA["3 Occupancy Tracking Agent\nPL/pgSQL"]
+    OTA -->|increments current_occupancy| TR
+
+    TR -->|PostgreSQL row trigger| NDA["4 Notification Dispatch Agent\nPL/pgSQL + Edge Function"]
+    NDA -->|FCM HTTP v1 API| Push["Student Devices\nPush Notifications"]
+
+    TR -->|Realtime WebSocket| VIA["5 Visualization Agent\nStudent App"]
+    BP -->|Realtime WebSocket| VIA
+    SE -->|Realtime WebSocket| VIA
+```
+
+> **Why is this called multi-agent?** Each agent is **reactive and decoupled** — the Telemetry Agent doesn't know the Geofence Agent exists; it only writes rows. The Geofence Agent doesn't know the Notification Agent exists; it only updates a column. This event-driven autonomy with no direct inter-agent coupling is the defining property of a multi-agent system.
 
 ---
 
 ## 🏛 System Architecture
+
 
 ```mermaid
 flowchart TB

@@ -1,12 +1,14 @@
-# College Bus Student App 🎓🚍
+# Multi-Agent Campus Transport Management System — Student Agent 🎓🚍🤖
 
-A real-time college bus transit tracker, interactive 3D satellite visualization, and occupancy monitoring application built with **Flutter**, **Supabase Realtime**, and **CesiumJS 3D**.
+> Part of the **Multi-Agent Campus Transport Management System (MACTMS)**.
+> This app is the **Visualization & Intelligence Agent** — responsible for consuming all upstream agent outputs (live GPS coordinates, geofence events, occupancy data) and surfacing them to students as an interactive real-time 3D satellite map with smart transfer recommendations.
 
 This app enables college students to track active buses in real-time, view live passenger occupancy, monitor delays and stop arrival alerts, lock the camera to follow vehicles along their routes, subscribe to route notifications, and receive smart bus transfer recommendations.
 
 ---
 
 ## 📋 Table of Contents
+- [Multi-Agent Context](#-multi-agent-context)
 - [Overview & Architecture](#-overview--architecture)
 - [Key Features](#-key-features)
 - [Tech Stack & Dependencies](#-tech-stack--dependencies)
@@ -15,6 +17,22 @@ This app enables college students to track active buses in real-time, view live 
 - [Environment Variables](#-environment-variables)
 - [Getting Started & Installation](#-getting-started--installation)
 - [Application Flow & Usage](#-application-flow--usage)
+
+---
+
+## 🤖 Multi-Agent Context
+
+This app is one of **five runtime agents** in the MACTMS ecosystem. It sits at the consumer end of the agent pipeline, subscribing to Supabase Realtime WebSocket broadcasts produced by all other agents.
+
+| Agent | Where | How It Feeds This App |
+|---|---|---|
+| **Telemetry Agent** | `driver_app` | Uploads GPS pings → `bus_positions` table |
+| **Geofence Detection Agent** | `geofence_trigger.sql` | Fires `ST_DWithin` checks → `stop_events` + `trips.running_status` |
+| **Occupancy Tracking Agent** | `occupancy_trigger.sql` | Increments `trips.current_occupancy` on every boarding |
+| **Notification Dispatch Agent** | `notification_setup.sql` + `send-push` Edge Function | Sends FCM pushes on delay/arrival events |
+| **Visualization & Intelligence Agent** | **This App** | Subscribes to all above outputs via Realtime WebSockets, renders live map, computes transfer suggestions |
+
+The Student App is **purely reactive** — it never initiates actions; it only responds to changes propagated through the shared database event bus by the other agents.
 
 ---
 

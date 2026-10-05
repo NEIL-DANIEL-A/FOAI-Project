@@ -1,12 +1,12 @@
-# College Bus Driver App 🚌
+# Multi-Agent Campus Transport Management System — Driver Agent 🚌🤖
 
-A real-time driver telemetry, route navigation, and passenger headcount logging application built with **Flutter**, **Supabase**, and **CesiumJS 3D**. 
-
-This app serves as the operational mobile interface for college bus drivers, allowing them to broadcast high-frequency GPS tracking data, navigate assigned routes, automatically detect stop arrivals via PostGIS geofencing, and record student boardings.
+> Part of the **Multi-Agent Campus Transport Management System (MACTMS)**.
+> This app is the **Telemetry Agent** — responsible for broadcasting live GPS position data, detecting stop geofences autonomously, and recording boarding headcounts into the shared Supabase backend.
 
 ---
 
 ## 📋 Table of Contents
+- [Multi-Agent Context](#-multi-agent-context)
 - [Overview & Architecture](#-overview--architecture)
 - [Key Features](#-key-features)
 - [Tech Stack & Dependencies](#-tech-stack--dependencies)
@@ -18,9 +18,69 @@ This app serves as the operational mobile interface for college bus drivers, all
 
 ---
 
+## 🤖 Multi-Agent Context
+
+This project is named **Multi-Agent Campus Transport Management System** because its runtime architecture is composed of **multiple independently operating agents**, each with a specialized role, which collaborate through a shared Supabase database event bus. The Driver App is one of those runtime agents.
+
+### Where are the agents?
+
+The system has two categories of agents:
+
+#### 1. 🔧 Development-Time AI Agents (`opencode.json`)
+During the construction of this project, an AI multi-agent framework (`opencode`) orchestrated a team of specialized LLM agents that wrote, reviewed, and debugged all code collaboratively:
+
+| Agent | Role | Model |
+|---|---|---|
+| `architect` *(primary)* | Lead orchestrator — designs system architecture, delegates tasks | `nemotron-3-ultra` |
+| `builder` *(subagent)* | Senior Flutter/SQL implementation specialist | `mimo-v2.5` |
+| `researcher` *(subagent)* | Technical research — PostGIS, Supabase APIs, CesiumJS | `deepseek-v4-flash` |
+| `debugger` *(subagent)* | Identifies and resolves runtime issues, validates logic | `nemotron-3.5-lightning` |
+| `reviewer` *(subagent)* | Independent senior code reviewer — security and correctness | `gpt-oss:120b` |
+
+#### 2. ⚙️ Runtime Autonomous Agents (the deployed system)
+These are the persistent agents that run after deployment — each is autonomous, reactive, and has a single well-defined responsibility:
+
+| Agent | Location | Trigger | Responsibility |
+|---|---|---|---|
+| **Telemetry Agent** | `driver_app` (Flutter) | Human-operated (driver) | Streams high-frequency GPS data to Supabase |
+| **Geofence Detection Agent** | `geofence_trigger.sql` → PostgreSQL | Every `bus_positions` upsert | Runs `ST_DWithin` checks against all stops, fires `arrived`/`departed` events and updates trip delay status autonomously |
+| **Occupancy Tracking Agent** | `occupancy_trigger.sql` → PostgreSQL | Every `stop_boardings` insert | Auto-increments `trips.current_occupancy` without any app-side logic |
+| **Notification Dispatch Agent** | `notification_setup.sql` + `supabase/functions/send-push` | Every `trips.running_status` change | Collects FCM tokens of subscribed students, constructs message payloads, dispatches push notifications via FCM HTTP v1 API |
+| **Visualization & Intelligence Agent** | `student_app` (Flutter) | Supabase Realtime WebSocket events | Consumes all agent outputs, renders them on a live 3D map, detects overcrowding, and surfaces smart transfer recommendations |
+
+### How do the agents communicate?
+
+All runtime agents communicate through the **shared Supabase PostgreSQL database as an event bus**:
+
+```mermaid
+graph LR
+    A["Telemetry Agent\n(Driver App)"] -->|Upserts GPS coords| BP[bus_positions Table]
+    BP -->|Row-level DB trigger fires| B["Geofence Detection Agent\n(PL/pgSQL Trigger)"]
+    B -->|Inserts arrived / departed| SE[stop_events Table]
+    B -->|Updates running_status| TR[trips Table]
+
+    SE -->|Realtime WebSocket broadcast| DA["Driver App\nHeadcount Modal"]
+    DA -->|Inserts boarding count| SB[stop_boardings Table]
+    SB -->|Row-level DB trigger fires| C["Occupancy Tracking Agent\n(PL/pgSQL Trigger)"]
+    C -->|Increments current_occupancy| TR
+
+    TR -->|Status change DB trigger fires| D["Notification Dispatch Agent\n(PL/pgSQL + Edge Function)"]
+    D -->|HTTP POST to FCM| E["Student Devices\nPush Notifications"]
+
+    TR -->|Realtime WebSocket broadcast| F["Visualization Agent\n(Student App)"]
+    BP -->|Realtime WebSocket broadcast| F
+    SE -->|Realtime WebSocket broadcast| F
+```
+
+### Why is this design called "multi-agent"?
+
+Each agent above is **autonomous** — it reacts to data state changes rather than being directly invoked by another agent. The Telemetry Agent doesn't know the Geofence Agent exists; it only writes to `bus_positions`. The Geofence Agent doesn't know the Notification Agent exists; it only updates `running_status`. This **decoupled, event-driven autonomy** is the defining property of a multi-agent system.
+
+---
+
 ## 🌐 Overview & Architecture
 
-The Driver App is designed for high reliability, accurate background location tracking, and simple one-handed operation while driving. 
+The Driver App (Telemetry Agent) is designed for high reliability, accurate background location tracking, and simple one-handed operation while driving.
 
 ```mermaid
 graph TD
@@ -60,7 +120,7 @@ graph TD
    - Ongoing Android foreground service notification (`flutter_local_notifications`), preventing the OS from terminating GPS tracking when the app is minimized or the screen locks.
    - Real-time updates pushed concurrently to `location_pings` (historical breadcrumbs) and `bus_positions` (latest coordinates).
 
-3. **PostGIS Geofenced Arrival Detection**:
+3. **PostGIS Geofenced Arrival Detection** *(Geofence Detection Agent)*:
    - Automatic stop detection powered by PostGIS database triggers (`ST_DWithin` against stop coordinates and radius).
    - Arrival events inserted into `stop_events` calculate delay thresholds and update trip status (`on_time`, `late`, `arrived`).
    - Client listens to Supabase Realtime channel `arrivals:<trip_id>` to immediately detect when the bus pulls into a stop.
@@ -68,7 +128,7 @@ graph TD
 4. **Interactive Boarding Headcount Pad**:
    - Automatically prompts the driver with an on-screen dialog upon entering any stop's geofence radius.
    - Custom on-screen numeric keypad (`0-9`, `⌫`, `C`) optimized for quick tap entry.
-   - Submitted headcount writes to `stop_boardings`, automatically incrementing total occupancy in `trips.current_occupancy` through database triggers.
+   - Submitted headcount writes to `stop_boardings`, automatically incrementing total occupancy in `trips.current_occupancy` through database triggers *(Occupancy Tracking Agent)*.
 
 5. **Integrated 3D/2D Cesium Digital Globe**:
    - Embedded 3D CesiumJS map running inside an Android WebView (`webview_flutter`).
