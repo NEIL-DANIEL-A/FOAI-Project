@@ -26,23 +26,23 @@ The Driver App is designed for high reliability, accurate background location tr
 graph TD
     Driver[Bus Driver] -->|Logs In / Registers| Auth[Supabase Auth]
     Driver -->|Selects Assigned Bus| Assignment[driver_bus_assignments]
-    Driver -->|Taps 'Start Trip'| Trip[trips Table]
-    
-    subgraph Location Pipeline
+    Driver -->|Taps Start Trip| Trip[trips Table]
+
+    subgraph LocationPipeline["Location Pipeline"]
         GPS[Device GPS / Geolocator] -->|High Accuracy Stream| Service[Foreground Service Notification]
         Service -->|10m Distance Filter| Pings[location_pings Table]
         Service -->|Live Coordinates| BusPos[bus_positions Table]
     end
 
-    subgraph Geofence & Arrival Trigger
-        BusPos -->|PostgreSQL Trigger| Trigger[handle_bus_position_update()]
+    subgraph GeofenceTrigger["Geofence and Arrival Trigger"]
+        BusPos -->|PostgreSQL Trigger| Trigger["handle_bus_position_update()"]
         Trigger -->|PostGIS ST_DWithin| StopEvents[stop_events Table]
-        StopEvents -->|Realtime WebSocket| RealtimeArrival[Realtime Channel: arrivals:trip_id]
+        StopEvents -->|Realtime WebSocket| RealtimeArrival["Realtime Channel - arrivals per trip"]
     end
 
     RealtimeArrival -->|Triggers Modal| Dialog[Boarding Headcount Dialog]
     Dialog -->|Driver Enters Count| Boardings[stop_boardings Table]
-    Boardings -->|DB Trigger| Occupancy[trips.current_occupancy Auto-Increment]
+    Boardings -->|DB Trigger| Occupancy["trips.current_occupancy Auto-Increment"]
 ```
 
 ---
