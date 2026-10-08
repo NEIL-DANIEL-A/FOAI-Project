@@ -612,7 +612,15 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
   Future<void> _stopLocationUpdates() async {
     await _positionSubscription?.cancel();
     _positionSubscription = null;
-    await flutterLocalNotificationsPlugin.cancel(888);
+    // Guarded: plugin.cancel() can throw a PlatformException
+    // (Gson "Missing type parameter" from its corrupt scheduled-cache on
+    // some Android builds). A notification-plugin crash must never break
+    // end-trip, so it is swallowed here as non-fatal.
+    try {
+      await flutterLocalNotificationsPlugin.cancel(888);
+    } catch (e) {
+      debugPrint('Notification cancel failed (non-fatal): $e');
+    }
   }
 
   Future<void> _showForegroundNotification() async {
@@ -626,12 +634,18 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
       showWhen: false,
     );
     const details = NotificationDetails(android: androidDetails);
-    await flutterLocalNotificationsPlugin.show(
-      888,
-      'Bus tracking active',
-      'Your location is being shared for this trip.',
-      details,
-    );
+    // Same guard as above: the sticky notification is nice-to-have;
+    // trip tracking must start even if the plugin misbehaves.
+    try {
+      await flutterLocalNotificationsPlugin.show(
+        888,
+        'Bus tracking active',
+        'Your location is being shared for this trip.',
+        details,
+      );
+    } catch (e) {
+      debugPrint('Foreground notification failed (non-fatal): $e');
+    }
   }
 
   void _subscribeToArrivals() {

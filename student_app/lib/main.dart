@@ -926,8 +926,6 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     }
   }
 
-  void _addSampleBusData() {}
-
   void _addSampleStops() {
     _stops = [
       StopInfo(id: 'demo_stop_1', routeId: 'demo_route', name: 'Electronic City', lat: 12.8456, lon: 77.6603, membersCount: 12),
@@ -939,8 +937,454 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
   }
 
   Timer? _demoTimer;
-  
-  void _startDemoMovement() {}
+  bool _demoActive = false;
+  bool _demoDialogOpen = false;
+  int _demoStep = 0;
+  int _demoOccupancy = 0;
+  String _demoStatus = 'on_time';
+  String _demoBusNumber = '';
+  String _demoRouteId = '';
+  String _demoRouteName = '';
+  int _demoCapacity = 40;
+  List<StopInfo> _demoStops = [];
+
+  static const int _demoStepsPerLeg = 6;
+
+  /// Full-feature demo for ANY bus in the database: pick a bus, watch it
+  /// drive its real route, get student arrival alerts, enter headcounts in
+  /// the driver-style pad, and see occupancy update for students.
+  void _showDemoBusPicker() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => FutureBuilder(
+        future: Future.wait([
+          _supabase.from('routes').select('id, name').order('name'),
+          _supabase.from('buses').select('id, bus_number, route_id, capacity').order('bus_number'),
+        ]),
+        builder: (ctx, snap) {
+          if (snap.connectionState == ConnectionState.waiting) {
+            return const SizedBox(
+              height: 200,
+              child: Center(child: CircularProgressIndicator(color: Color(0xFF6366F1))),
+            );
+          }
+          if (snap.hasError || !snap.hasData) {
+            return Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Couldn\'t load buses from the database.',
+                    style: TextStyle(color: Color(0xFFF8FAFC), fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Check internet, or preview with the sample route.',
+                    style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                  ),
+                  const SizedBox(height: 16),
+                  ElevatedButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _startSampleDemo();
+                    },
+                    child: const Text('Demo with sample route'),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+              ),
+            );
+          }
+          final routes = (snap.data![0] as List).cast<Map<String, dynamic>>();
+          final buses = (snap.data![1] as List).cast<Map<String, dynamic>>();
+          final routeName = {for (final r in routes) r['id'] as String: r['name'] as String};
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 12),
+              Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF475569),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Demo a bus',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFFF8FAFC)),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Pick any bus - arrivals, headcount & occupancy play out live',
+                style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+              ),
+              const SizedBox(height: 12),
+              Flexible(
+                child: ListView(
+                  shrinkWrap: true,
+                  children: [
+                    for (final b in buses)
+                      ListTile(
+                        leading: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF6366F1).withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            b['bus_number'] as String,
+                            style: const TextStyle(fontWeight: FontWeight.w700, color: Color(0xFF6366F1)),
+                          ),
+                        ),
+                        title: Text(
+                          routeName[b['route_id']] ?? 'Unknown route',
+                          style: const TextStyle(color: Color(0xFFF8FAFC)),
+                        ),
+                        subtitle: Text(
+                          'Capacity ${b['capacity'] ?? '-'}',
+                          style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+                        ),
+                        trailing: const Icon(Icons.play_circle_outline, color: Color(0xFF94A3B8)),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          _startDemoForBus(
+                            busNumber: b['bus_number'] as String,
+                            routeId: b['route_id'] as String,
+                            routeName: routeName[b['route_id']] ?? 'Demo Route',
+                            capacity: (b['capacity'] as num?)?.toInt() ?? 40,
+                          );
+                        },
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Fallback demo when the database can't be reached.
+  void _startSampleDemo() {
+    _addSampleStops();
+    _beginDemoTrip(
+      busNumber: 'DEMO',
+      routeId: _stops.first.routeId,
+      routeName: 'Sample Route',
+      capacity: 40,
+      stops: List.of(_stops),
+    );
+  }
+
+  Future<void> _startDemoForBus({
+    required String busNumber,
+    required String routeId,
+    required String routeName,
+    required int capacity,
+  }) async {
+    var stops = _stops.where((s) => s.routeId == routeId).toList();
+    if (stops.isEmpty) {
+      try {
+        final data = await _supabase
+            .from('stops')
+            .select('id, route_id, name, lat, lon')
+            .eq('route_id', routeId)
+            .order('sequence_no');
+        stops = (data as List)
+            .map((s) => StopInfo(
+                  id: s['id'] as String,
+                  routeId: s['route_id'] as String,
+                  name: s['name'] as String,
+                  lat: (s['lat'] as num).toDouble(),
+                  lon: (s['lon'] as num).toDouble(),
+                ))
+            .toList();
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Couldn\'t load stops: $e')),
+          );
+        }
+        return;
+      }
+    }
+    if (stops.length < 2) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('This route needs at least 2 stops for a demo.')),
+        );
+      }
+      return;
+    }
+    _beginDemoTrip(
+      busNumber: busNumber,
+      routeId: routeId,
+      routeName: routeName,
+      capacity: capacity,
+      stops: stops,
+    );
+  }
+
+  void _beginDemoTrip({
+    required String busNumber,
+    required String routeId,
+    required String routeName,
+    required int capacity,
+    List<StopInfo>? stops,
+  }) {
+    _demoTimer?.cancel();
+    setState(() {
+      _demoActive = true;
+      _demoDialogOpen = false;
+      _demoStep = 0;
+      _demoOccupancy = 0;
+      _demoStatus = 'on_time';
+      _demoBusNumber = busNumber;
+      _demoRouteId = routeId;
+      _demoRouteName = routeName;
+      _demoCapacity = capacity;
+      if (stops != null) _demoStops = stops;
+    });
+    _placeDemoBus();
+    // Bring the map to the demo route even if it was looking elsewhere.
+    _sendToMap(_enc({'type': 'flyToBus', 'id': 'demo-trip'}));
+    _demoTimer = Timer.periodic(const Duration(seconds: 2), (_) => _demoTick());
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Demo: bus $busNumber on "$routeName". Arrival + headcount coming up.'),
+          backgroundColor: const Color(0xFF6366F1),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+    // Opening arrival right away so the full flow shows within seconds.
+    _showArrivalAlert(_demoBusNumber, _demoStops.first.name);
+    _showDemoHeadcountDialog(_demoStops.first.name);
+  }
+
+  void _stopDemo() {
+    _demoTimer?.cancel();
+    _demoTimer = null;
+    _buses.remove('demo-trip');
+    if (_trackingTripId == 'demo-trip') _trackingTripId = null;
+    if (mounted) {
+      setState(() {
+        _demoActive = false;
+        _demoDialogOpen = false;
+      });
+    }
+    _syncMarkersToMap();
+  }
+
+  double _lerp(double a, double b, double t) => a + (b - a) * t;
+
+  /// Position along the demo route polyline at global step [s].
+  /// Steps past the end clamp to the terminus (no looping).
+  List<double> _demoPosition(int s) {
+    final legs = _demoStops.length - 1;
+    final total = legs * _demoStepsPerLeg;
+    if (s >= total) {
+      final last = _demoStops.last;
+      return [last.lat, last.lon];
+    }
+    final leg = s ~/ _demoStepsPerLeg;
+    final f = (s % _demoStepsPerLeg) / _demoStepsPerLeg;
+    final a = _demoStops[leg];
+    final b = _demoStops[leg + 1];
+    return [_lerp(a.lat, b.lat, f), _lerp(a.lon, b.lon, f)];
+  }
+
+  void _placeDemoBus() {
+    final pos = _demoPosition(_demoStep);
+    _buses['demo-trip'] = BusInfo(
+      tripId: 'demo-trip',
+      busNumber: _demoBusNumber,
+      routeId: _demoRouteId,
+      routeName: _demoRouteName,
+      capacity: _demoCapacity,
+      currentOccupancy: _demoOccupancy,
+      runningStatus: _demoStatus,
+      lat: pos[0],
+      lon: pos[1],
+    );
+    if (mounted) setState(() {});
+    _syncMarkersToMap();
+  }
+
+  void _demoTick() {
+    if (!_demoActive || _demoDialogOpen || _demoStops.length < 2) return;
+    final legs = _demoStops.length - 1;
+    final total = legs * _demoStepsPerLeg;
+    _demoStep = _demoStep + 1;
+    if (_demoStep > total) {
+      // Route complete - end the demo instead of looping.
+      final busNum = _demoBusNumber;
+      final stopCount = _demoStops.length;
+      _stopDemo();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Demo finished - bus $busNum completed all $stopCount stops.'),
+            backgroundColor: const Color(0xFF22C55E),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+      return;
+    }
+    if (_demoStep % _demoStepsPerLeg == 0) {
+      // Just arrived at a stop: flip status, alert students, ask driver.
+      final stopName = _demoStops[_demoStep ~/ _demoStepsPerLeg].name;
+      _demoStatus = 'arrived';
+      _placeDemoBus();
+      _showArrivalAlert(_demoBusNumber, stopName);
+      _showDemoHeadcountDialog(stopName);
+    } else {
+      _demoStatus = 'on_time';
+      _placeDemoBus();
+    }
+  }
+
+  /// Driver-style boarding pad, simulated inside the demo.
+  void _showDemoHeadcountDialog(String stopName) {
+    _demoDialogOpen = true;
+    final controller = TextEditingController(text: '0');
+    void append(String d) {
+      if (controller.text == '0') {
+        controller.text = d;
+      } else {
+        controller.text += d;
+      }
+    }
+
+    void backspace() {
+      if (controller.text.length > 1) {
+        controller.text = controller.text.substring(0, controller.text.length - 1);
+      } else {
+        controller.text = '0';
+      }
+    }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          title: Text('Driver: boarding at $stopName'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'How many students boarded? (students see this live)',
+                style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                readOnly: true,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold),
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  contentPadding: EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                height: 200,
+                width: 240,
+                child: GridView.builder(
+                  physics: const NeverScrollableScrollPhysics(),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    mainAxisSpacing: 6,
+                    crossAxisSpacing: 6,
+                  ),
+                  itemCount: 12,
+                  itemBuilder: (ctx, i) {
+                    if (i < 9) {
+                      final num = '${i + 1}';
+                      return _demoNumpadKey(num, () {
+                        append(num);
+                        setDialogState(() {});
+                      });
+                    } else if (i == 9) {
+                      return _demoNumpadKey('0', () {
+                        append('0');
+                        setDialogState(() {});
+                      });
+                    } else if (i == 10) {
+                      return _demoNumpadKey('⌫', () {
+                        backspace();
+                        setDialogState(() {});
+                      });
+                    }
+                    return _demoNumpadKey('C', () {
+                      controller.text = '0';
+                      setDialogState(() {});
+                    });
+                  },
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Skip'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final count = int.tryParse(controller.text) ?? 0;
+                Navigator.pop(ctx);
+                _demoOccupancy = (_demoOccupancy + count).clamp(0, _demoCapacity);
+                _demoStatus = 'on_time';
+                _placeDemoBus();
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        '$count boarded - bus $_demoBusNumber now $_demoOccupancy/$_demoCapacity',
+                      ),
+                      backgroundColor: const Color(0xFF22C55E),
+                      duration: const Duration(seconds: 3),
+                    ),
+                  );
+                }
+              },
+              child: const Text('Submit'),
+            ),
+          ],
+        ),
+      ),
+    ).then((_) {
+      controller.dispose();
+      _demoDialogOpen = false;
+    });
+  }
+
+  Widget _demoNumpadKey(String label, VoidCallback onTap) {
+    return ElevatedButton(
+      onPressed: onTap,
+      style: ElevatedButton.styleFrom(
+        backgroundColor: const Color(0xFF2C2C2C),
+        foregroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+      child: Text(label, style: const TextStyle(fontSize: 20)),
+    );
+  }
 
   @override
   void dispose() {
@@ -950,6 +1394,30 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     _stopsSub?.unsubscribe();
     _stopEventsSub?.unsubscribe();
     super.dispose();
+  }
+
+  /// Student "bus is near" banner. Used by live stop_events and the demo.
+  void _showArrivalAlert(String busNum, String stopName) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.radar, color: Colors.white),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Alert: $busNum is near stop "$stopName"!',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: const Color(0xFF6366F1),
+        duration: const Duration(seconds: 5),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
   }
 
   void _subscribeToRealtime() {
@@ -1088,28 +1556,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                   }
                 }
 
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Row(
-                        children: [
-                          const Icon(Icons.radar, color: Colors.white),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Text(
-                              'Alert: $busNum is near stop "$stopName"!',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ],
-                      ),
-                      backgroundColor: const Color(0xFF6366F1),
-                      duration: const Duration(seconds: 5),
-                      behavior: SnackBarBehavior.floating,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                    ),
-                  );
-                }
+                if (mounted) _showArrivalAlert(busNum, stopName);
               } catch (e) {
                 debugPrint('Error processing stop event: $e');
               }
@@ -1624,6 +2071,102 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
               ),
             ),
           ),
+
+          // Empty state with Demo button (no live buses)
+          if (_buses.isEmpty && _mapReady && !_isLoadingData && !_demoActive)
+            Positioned.fill(
+              child: Center(
+                child: Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 32),
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B).withValues(alpha: 0.95),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: const Color(0xFF334155)),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.directions_bus,
+                        size: 40,
+                        color: Color(0xFF6366F1),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'No live buses right now',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFFF8FAFC),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      const Text(
+                        'Start a driver trip, or demo any bus: arrivals, headcount & occupancy.',
+                        style: TextStyle(fontSize: 13, color: Color(0xFF94A3B8)),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 16),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 48,
+                        child: ElevatedButton.icon(
+                          onPressed: _showDemoBusPicker,
+                          icon: const Icon(Icons.play_circle_outline, color: Colors.white),
+                          label: const Text(
+                            'Start Demo',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 15,
+                            ),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF6366F1),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          // Stop demo button
+          if (_demoActive)
+            Positioned(
+              bottom: 150,
+              left: 16,
+              child: GestureDetector(
+                onTap: _stopDemo,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF59E0B).withValues(alpha: 0.95),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.stop_circle, color: Colors.white, size: 18),
+                      SizedBox(width: 6),
+                      Text(
+                        'Stop Demo',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
 
           // Stop tracking button (shown when tracking a bus)
           if (_trackingTripId != null)
