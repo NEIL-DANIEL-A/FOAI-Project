@@ -9,6 +9,12 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'ai_sim_screen.dart';
+import 'ai/astar.dart';
+import 'ai/csp.dart';
+import 'ai/demand.dart';
+import 'ai/road_graph.dart';
+import 'ai/route_geometry.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -497,6 +503,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
 class BusInfo {
   final String tripId;
+  final String busId;
+  final String slotId;
   final String busNumber;
   final String routeId;
   final String routeName;
@@ -508,6 +516,8 @@ class BusInfo {
 
   BusInfo({
     required this.tripId,
+    this.busId = '',
+    this.slotId = '',
     required this.busNumber,
     required this.routeId,
     required this.routeName,
@@ -523,6 +533,8 @@ class BusInfo {
   BusInfo copyWith({double? lat, double? lon, int? currentOccupancy, String? runningStatus}) {
     return BusInfo(
       tripId: tripId,
+      busId: busId,
+      slotId: slotId,
       busNumber: busNumber,
       routeId: routeId,
       routeName: routeName,
@@ -542,6 +554,7 @@ class StopInfo {
   final double lat;
   final double lon;
   final int membersCount;
+  final int sequence;
 
   StopInfo({
     required this.id,
@@ -550,6 +563,7 @@ class StopInfo {
     required this.lat,
     required this.lon,
     this.membersCount = 0,
+    this.sequence = 0,
   });
 }
 
@@ -765,7 +779,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     final trip = await _supabase
         .from('trips')
         .select(
-          'id, status, bus_id, route_id, running_status, current_occupancy, '
+          'id, status, bus_id, route_id, slot_id, running_status, current_occupancy, '
           'buses(bus_number, capacity), routes(name)',
         )
         .eq('id', tripId)
@@ -798,6 +812,8 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
 
     _buses[tripId] = BusInfo(
       tripId: tripId,
+      busId: (trip['bus_id'] as String?) ?? '',
+      slotId: (trip['slot_id'] as String?) ?? '',
       busNumber: bus['bus_number'] as String,
       routeId: trip['route_id'] as String,
       routeName: route['name'] as String,
@@ -807,6 +823,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       lat: (pos['lat'] as num).toDouble(),
       lon: (pos['lon'] as num).toDouble(),
     );
+    _loadAssignments();
   }
 
   void _removeTripFromMap(String tripId) {
@@ -829,7 +846,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       // Load trips with related data
       final trips = await _supabase
           .from('trips')
-          .select('id, bus_id, route_id, running_status, current_occupancy, buses(bus_number, capacity), routes(name)')
+          .select('id, bus_id, route_id, slot_id, running_status, current_occupancy, buses(bus_number, capacity), routes(name)')
           .eq('status', 'in_progress');
 
       debugPrint('Loaded ${trips.length} trips');
@@ -839,7 +856,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       debugPrint('Loaded ${positions.length} positions');
 
       // Load stops
-      final stops = await _supabase.from('stops').select('id, route_id, name, lat, lon').order('sequence_no');
+      final stops = await _supabase.from('stops').select('id, route_id, name, lat, lon, sequence_no').order('sequence_no');
       debugPrint('Loaded ${stops.length} stops');
 
       final posByTrip = {for (final p in positions) p['trip_id'] as String: p};
@@ -861,6 +878,8 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
           final tripId = trip['id'] as String;
           _buses[tripId] = BusInfo(
             tripId: tripId,
+            busId: (trip['bus_id'] as String?) ?? '',
+            slotId: (trip['slot_id'] as String?) ?? '',
             busNumber: bus['bus_number'] as String,
             routeId: trip['route_id'] as String,
             routeName: route['name'] as String,
@@ -887,6 +906,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                 lat: (s['lat'] as num).toDouble(),
                 lon: (s['lon'] as num).toDouble(),
                 membersCount: 0,
+                sequence: (s['sequence_no'] as num?)?.toInt() ?? 0,
               );
             } catch (e) {
               debugPrint('Error processing stop: $e');
@@ -906,9 +926,10 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       debugPrint('Processed ${_buses.length} buses and ${_stops.length} stops');
 
       _subscribeToRealtime();
-      
+      _loadAssignments();
+
       // Only show real active movements.
-      
+
       if (mounted) {
         setState(() {
           _isLoadingData = false;
@@ -1055,6 +1076,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                         onTap: () {
                           Navigator.pop(ctx);
                           _startDemoForBus(
+                            busId: b['id'] as String,
                             busNumber: b['bus_number'] as String,
                             routeId: b['route_id'] as String,
                             routeName: routeName[b['route_id']] ?? 'Demo Route',
@@ -1086,6 +1108,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
   }
 
   Future<void> _startDemoForBus({
+    required String busId,
     required String busNumber,
     required String routeId,
     required String routeName,
@@ -1096,7 +1119,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       try {
         final data = await _supabase
             .from('stops')
-            .select('id, route_id, name, lat, lon')
+            .select('id, route_id, name, lat, lon, sequence_no')
             .eq('route_id', routeId)
             .order('sequence_no');
         stops = (data as List)
@@ -1106,6 +1129,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                   name: s['name'] as String,
                   lat: (s['lat'] as num).toDouble(),
                   lon: (s['lon'] as num).toDouble(),
+                  sequence: (s['sequence_no'] as num?)?.toInt() ?? 0,
                 ))
             .toList();
       } catch (e) {
@@ -1125,13 +1149,278 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       }
       return;
     }
+    // AI: run the REAL CSP for this route's slot so the demo bus serves its
+    // assigned stops (skipping the rest) instead of visiting everything.
+    // May narrow [stops] down to this bus's share.
+    final assigned = await _prepareDemoCsp(
+      busId: busId,
+      busNumber: busNumber,
+      routeId: routeId,
+      stops: stops,
+    );
     _beginDemoTrip(
       busNumber: busNumber,
       routeId: routeId,
       routeName: routeName,
       capacity: capacity,
-      stops: stops,
+      stops: assigned,
     );
+  }
+
+  // ---------- AI demo: CSP assignment + Google-style route overlay ----------
+  // Same CspAssignmentService / AStarService the live apps and the 🧠 screen use.
+  int _demoTargetIdx = 0;
+  String _demoSlotLabel = '';
+  String _demoServeText = '';
+  String _demoSkipText = '';
+  String _demoCspLine = '';
+  String _demoLegLine = '';
+  final Map<String, List<List<double>>> _demoGeoCache = {};
+
+  /// Runs CSP for the picked bus's slot. Returns the stops THIS bus serves
+  /// (ordered); the rest are shown as skips in the overlay card.
+  Future<List<StopInfo>> _prepareDemoCsp({
+    required String busId,
+    required String busNumber,
+    required String routeId,
+    required List<StopInfo> stops,
+  }) async {
+    _demoSlotLabel = '';
+    _demoServeText = stops.map((s) => s.name).join('→');
+    _demoSkipText = '';
+    _demoCspLine = 'No slot plan — serving all stops';
+    try {
+      // Slot containing this bus, else the route's first active slot.
+      final slots = await _supabase
+          .from('operating_slots')
+          .select('id, label')
+          .eq('route_id', routeId)
+          .eq('is_active', true)
+          .order('slot_time');
+      if ((slots as List).isEmpty) return stops;
+      var slotId = slots.first['id'] as String;
+      _demoSlotLabel = slots.first['label'] as String? ?? '';
+      for (final s in slots) {
+        final has = await _supabase
+            .from('slot_buses')
+            .select('bus_id')
+            .eq('slot_id', s['id'])
+            .eq('bus_id', busId)
+            .maybeSingle();
+        if (has != null) {
+          slotId = s['id'] as String;
+          _demoSlotLabel = s['label'] as String? ?? '';
+          break;
+        }
+      }
+      final poolRows = await _supabase
+          .from('slot_buses')
+          .select('bus_id, is_available, buses(bus_number, capacity)')
+          .eq('slot_id', slotId);
+      // Demand: real history when it exists, else labeled sample demand.
+      final since = DateTime.now().subtract(const Duration(days: 14)).toIso8601String().split('T')[0];
+      final ids = stops.map((s) => s.id).toList();
+      var grouped = <String, List<BoardingSample>>{};
+      try {
+        final rows = await _supabase
+            .from('stop_boardings')
+            .select('stop_id, boarding_count, recorded_at')
+            .inFilter('stop_id', ids)
+            .gte('recorded_at', since);
+        grouped = DemandEstimationService.group(
+          (rows as List).cast<Map<String, dynamic>>(),
+          stopIdKey: 'stop_id',
+          countKey: 'boarding_count',
+          dateKey: 'recorded_at',
+        );
+      } catch (_) {}
+      for (final s in stops) {
+        grouped.putIfAbsent(s.id, () => []);
+      }
+      final totalSamples = grouped.values.fold(0, (a, l) => a + l.length);
+      const sample = [10.0, 8.0, 15.0, 5.0, 12.0, 7.0, 9.0, 6.0, 11.0, 8.0];
+      final demand = <String, double>{};
+      final String demandNote;
+      if (totalSamples == 0) {
+        for (var i = 0; i < stops.length; i++) {
+          demand[stops[i].id] = sample[i % sample.length];
+        }
+        demandNote = 'sample demand';
+      } else {
+        final est = DemandEstimationService.estimate(grouped, safetyFactor: 1.1);
+        for (final s in stops) {
+          demand[s.id] = est[s.id]!.expected;
+        }
+        demandNote = 'history ×1.1';
+      }
+      final cspStops = [
+        for (final s in stops)
+          CspStop(id: s.id, label: s.name, demand: demand[s.id]!, sequence: s.sequence),
+      ];
+      final cspBuses = <CspBus>[
+        for (final r in (poolRows as List))
+          CspBus(
+            id: r['bus_id'] as String,
+            label: '${(r['buses'] as Map<String, dynamic>?)?['bus_number'] ?? '?'}',
+            capacity: ((r['buses'] as Map<String, dynamic>?)?['capacity'] as num?)?.toInt() ?? 40,
+            available: (r['is_available'] as bool?) ?? true,
+          ),
+      ];
+      final result = const CspAssignmentService().solve(stops: cspStops, buses: cspBuses);
+      if (result.feasible && result.best != null) {
+        final best = result.best!;
+        final byId = {for (final s in stops) s.id: s};
+        final mine = best.assignment.entries
+            .where((e) => e.value == busId)
+            .map((e) => e.key)
+            .where((id) => byId.containsKey(id))
+            .toList()
+          ..sort((a, b) => byId[a]!.sequence.compareTo(byId[b]!.sequence));
+        if (mine.isNotEmpty) {
+          final labelOf = {for (final b in cspBuses) b.id: b.label};
+          final skipByBus = <String, List<String>>{};
+          for (final e in best.assignment.entries) {
+            if (e.value != busId && byId.containsKey(e.key)) {
+              skipByBus.putIfAbsent(labelOf[e.value] ?? '?', () => []).add(byId[e.key]!.name);
+            }
+          }
+          final served = [for (final id in mine) byId[id]!];
+          _demoServeText = served.map((s) => s.name).join('→');
+          _demoSkipText =
+              skipByBus.entries.map((e) => '${e.value.join(', ')} → Bus ${e.key}').join(' • ');
+          _demoCspLine =
+              'CSP ($demandNote): ${result.assignmentsTried} tried • ${result.backtracks} backtracks • score ${best.score.toStringAsFixed(2)}';
+          if (mounted) setState(() {});
+          return served;
+        }
+      }
+    } catch (e) {
+      debugPrint('Demo CSP fallback (all stops): $e');
+    }
+    if (mounted) setState(() {});
+    return stops;
+  }
+
+  /// Next assigned stop the bus is heading to (advanced on every dialog close).
+  StopInfo? _demoNextStop() {
+    if (_demoStops.isEmpty) return null;
+    return _demoStops[_demoTargetIdx.clamp(0, _demoStops.length - 1)];
+  }
+
+  String? _storedPrefix(RoadGraph g, String a, String b) {
+    for (final e in [...g.adjacency[a] ?? [], ...g.adjacency[b] ?? []]) {
+      if ((e.from == a && e.to == b) || (e.from == b && e.to == a)) {
+        return e.id.split(':').first;
+      }
+    }
+    return null;
+  }
+
+  Future<List<List<double>>> _demoGeometry(String key, List<List<double>> straight) async {
+    final hit = _demoGeoCache[key];
+    if (hit != null) return hit;
+    final geo = await RouteGeometry.fetchRoadPath(straight);
+    _demoGeoCache[key] = geo;
+    return geo;
+  }
+
+  void _sendDemoPath(String id, List<List<double>> pts, String color, int width) {
+    if (_webViewController == null || !_mapReady || pts.length < 2) return;
+    final sb = StringBuffer('{"type":"drawPath","id":"$id","color":"$color","width":$width,"points":[');
+    for (var i = 0; i < pts.length; i++) {
+      if (i > 0) sb.write(',');
+      sb.write('[${pts[i][0]},${pts[i][1]}]');
+    }
+    sb.write(']}');
+    try {
+      _webViewController!.runJavaScript('handleMessage(${sb.toString()})');
+    } catch (e) {
+      debugPrint('Demo path draw failed: $e');
+    }
+  }
+
+  /// Google-Maps-style overlay for the current leg: A* best route in blue,
+  /// the next-best alternative in gray, both road-snapped. Runs the REAL
+  /// AStarService on the full route road network.
+  Future<void> _refreshDemoRouteOverlay() async {
+    if (!_demoActive || _demoStops.length < 2) return;
+    try {
+      final routeStops = _stops.where((s) => s.routeId == _demoRouteId).toList()
+        ..sort((a, b) => a.sequence.compareTo(b.sequence));
+      if (routeStops.length < 2) return;
+      final graph = RoadGraph.fromStops([
+        for (final s in routeStops)
+          GraphStop(id: s.id, name: s.name, lat: s.lat, lon: s.lon, sequence: s.sequence),
+      ]);
+      final cur = _buses['demo-trip'];
+      final next = _demoNextStop();
+      if (cur == null || next == null) return;
+      // Already at the final stop: nothing left to route.
+      if (_demoTargetIdx >= _demoStops.length - 1 &&
+          RoadGraph.haversineM(cur.lat, cur.lon, next.lat, next.lon) < 80) {
+        _sendToMap(_enc({'type': 'clearPath', 'id': 'demo-best'}));
+        _sendToMap(_enc({'type': 'clearPath', 'id': 'demo-alt'}));
+        return;
+      }
+      // Temporary start node at the live demo position.
+      const gpsId = 'demo-gps';
+      graph.addNode(RoadNode(id: gpsId, label: 'Bus $_demoBusNumber', lat: cur.lat, lon: cur.lon));
+      final byDist = List<StopInfo>.of(routeStops)
+        ..sort((a, b) => RoadGraph.haversineM(cur.lat, cur.lon, a.lat, a.lon)
+            .compareTo(RoadGraph.haversineM(cur.lat, cur.lon, b.lat, b.lon)));
+      for (var i = 0; i < (byDist.length < 2 ? byDist.length : 2); i++) {
+        final d = RoadGraph.haversineM(cur.lat, cur.lon, byDist[i].lat, byDist[i].lon);
+        graph.addUndirectedEdge(
+          id: 'demo-link:$i',
+          a: gpsId,
+          b: 'stop:${byDist[i].id}',
+          cost: d / 8.0,
+          distanceM: d,
+        );
+      }
+      final legTag = _demoTargetIdx;
+      final best =
+          const AStarService().findPath(graph, gpsId, 'stop:${next.id}', recordTrace: false);
+      if (!best.found) return;
+      // Alternative: block the middle edge of the best path and re-run.
+      AstarResult? alt;
+      if (best.path.length >= 3) {
+        final a = best.path[1];
+        final b = best.path[2];
+        final prefix = _storedPrefix(graph, a, b);
+        if (prefix != null) {
+          graph.setBlocked(prefix, true);
+          final r2 =
+              const AStarService().findPath(graph, gpsId, 'stop:${next.id}', recordTrace: false);
+          if (r2.found && r2.path.join() != best.path.join()) alt = r2;
+        }
+      }
+      List<List<double>> coordsOf(List<String> path) =>
+          [for (final id in path) [graph.nodes[id]!.lat, graph.nodes[id]!.lon]];
+      final bestGeo = await _demoGeometry('best:${next.id}:$legTag', coordsOf(best.path));
+      if (!_demoActive) return;
+      _sendDemoPath('demo-best', bestGeo, '#2563EB', 6);
+      var altTxt = 'no alternative';
+      if (alt != null) {
+        final altGeo = await _demoGeometry('alt:${next.id}:$legTag', coordsOf(alt.path));
+        if (!_demoActive) return;
+        _sendDemoPath('demo-alt', altGeo, '#9CA3AF', 4);
+        altTxt = 'alt +${((alt.cost - best.cost) * 8 / 1000).toStringAsFixed(1)} km';
+      } else {
+        _sendToMap(_enc({'type': 'clearPath', 'id': 'demo-alt'}));
+      }
+      final km = best.cost * 8 / 1000;
+      final mins = best.cost / 60;
+      if (mounted) {
+        setState(() {
+          _demoLegLine =
+              'A* → ${next.name}: best ${km.toStringAsFixed(1)} km ~${mins.toStringAsFixed(0)} min '
+              '(${best.nodesExpanded} nodes) • $altTxt';
+        });
+      }
+    } catch (e) {
+      debugPrint('Demo overlay failed: $e');
+    }
   }
 
   void _beginDemoTrip({
@@ -1152,6 +1441,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       _demoRouteId = routeId;
       _demoRouteName = routeName;
       _demoCapacity = capacity;
+      _demoTargetIdx = 0;
       if (stops != null) _demoStops = stops;
     });
     _placeDemoBus();
@@ -1177,6 +1467,8 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     _demoTimer = null;
     _buses.remove('demo-trip');
     if (_trackingTripId == 'demo-trip') _trackingTripId = null;
+    _sendToMap(_enc({'type': 'clearPath', 'id': 'demo-best'}));
+    _sendToMap(_enc({'type': 'clearPath', 'id': 'demo-alt'}));
     if (mounted) {
       setState(() {
         _demoActive = false;
@@ -1371,6 +1663,12 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     ).then((_) {
       controller.dispose();
       _demoDialogOpen = false;
+      // Bus departs the served stop: aim the next assigned stop and redraw
+      // the Google-style best/alternative route overlay for the new leg.
+      if (_demoActive && _demoStops.isNotEmpty) {
+        _demoTargetIdx = (_demoTargetIdx + 1).clamp(0, _demoStops.length - 1);
+        _refreshDemoRouteOverlay();
+      }
     });
   }
 
@@ -1393,6 +1691,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     _tripsSub?.unsubscribe();
     _stopsSub?.unsubscribe();
     _stopEventsSub?.unsubscribe();
+    _assignSub?.unsubscribe();
     super.dispose();
   }
 
@@ -1508,6 +1807,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                   lat: (rec['lat'] as num).toDouble(),
                   lon: (rec['lon'] as num).toDouble(),
                   membersCount: 0,
+                  sequence: (rec['sequence_no'] as num?)?.toInt() ?? 0,
                 );
                 if (idx != -1) {
                   _stops[idx] = updatedStop;
@@ -1534,10 +1834,16 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
             callback: (payload) async {
               try {
                 final rec = payload.newRecord;
-                if (rec['event_type'] != 'arrived') return;
                 final tripId = rec['trip_id'] as String?;
                 final stopId = rec['stop_id'] as String?;
                 if (tripId == null || stopId == null) return;
+                // Track served stops so the AI assignment panel shows live progress.
+                if (rec['event_type'] == 'departed') {
+                  _departedByTrip.putIfAbsent(tripId, () => {}).add(stopId);
+                  if (mounted) setState(() {});
+                  return;
+                }
+                if (rec['event_type'] != 'arrived') return;
 
                 // Look up bus
                 final bus = _buses[tripId];
@@ -1563,8 +1869,70 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
             },
           )
           .subscribe();
+
+      // AI: stop assignments change when CSP (re)plans a slot.
+      _assignSub = _supabase
+          .channel('public:stop_assignments')
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'stop_assignments',
+            callback: (_) => _loadAssignments(),
+          )
+          .subscribe();
     } catch (e) {
       debugPrint('Error setting up realtime subscriptions: $e');
+    }
+  }
+
+  /// AI assignment state: tripId -> ordered stopIds (CSP output for that
+  /// trip's slot+bus), plus departed stopIds per trip for live progress.
+  final Map<String, List<String>> _assignedByTrip = {};
+  final Map<String, Set<String>> _departedByTrip = {};
+  RealtimeChannel? _assignSub;
+
+  /// Loads CSP stop assignments for the visible trips and matches them via
+  /// (slot_id, bus_id). Trips without a plan fall back to all route stops.
+  Future<void> _loadAssignments() async {
+    if (_buses.isEmpty) return;
+    try {
+      final rows = await _supabase.from('stop_assignments').select('slot_id, stop_id, bus_id');
+      final byStop = {for (final s in _stops) s.id: s};
+      final next = <String, List<String>>{};
+      for (final trip in _buses.values) {
+        if (trip.slotId.isEmpty) continue;
+        final mine = (rows as List).where((r) =>
+            r['slot_id'] == trip.slotId && r['bus_id'] == trip.busId);
+        final ordered = mine
+            .map((r) => r['stop_id'] as String)
+            .where((id) => byStop.containsKey(id))
+            .toList()
+          ..sort((a, b) => byStop[a]!.sequence.compareTo(byStop[b]!.sequence));
+        if (ordered.isNotEmpty) next[trip.tripId] = ordered;
+      }
+      // Departed stops per active trip (served progress).
+      for (final tripId in _buses.keys) {
+        try {
+          final evs = await _supabase
+              .from('stop_events')
+              .select('stop_id')
+              .eq('trip_id', tripId)
+              .eq('event_type', 'departed');
+          _departedByTrip[tripId] = {
+            for (final e in (evs as List)) e['stop_id'] as String
+          };
+        } catch (e) {
+          debugPrint('AI departed load failed: $e');
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _assignedByTrip
+          ..clear()
+          ..addAll(next);
+      });
+    } catch (e) {
+      debugPrint('AI assignments unavailable: $e');
     }
   }
 
@@ -1995,6 +2363,28 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                   ),
                   const SizedBox(width: 8),
                   
+                  // AI Algorithm Simulation button
+                  GestureDetector(
+                    onTap: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const AiSimScreen()),
+                      );
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF22C55E).withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.psychology,
+                        color: Color(0xFF22C55E),
+                        size: 20,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+
                   // Notifications button
                   GestureDetector(
                     onTap: _showSubscriptionSheet,
@@ -2132,6 +2522,117 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                       ),
                     ],
                   ),
+                ),
+              ),
+            ),
+
+          // AI demo overlay: CSP assignment + A* best/alt route, Google-style.
+          if (_demoActive)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 70,
+              left: 16,
+              right: 16,
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F172A).withValues(alpha: 0.92),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                      color: const Color(0xFF2563EB).withValues(alpha: 0.5)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.psychology,
+                            size: 15, color: Color(0xFF22C55E)),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            'AI DEMO · Bus $_demoBusNumber${_demoSlotLabel.isEmpty ? '' : ' ($_demoSlotLabel)'}',
+                            style: const TextStyle(
+                                fontSize: 12, fontWeight: FontWeight.w800),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        GestureDetector(
+                          onTap: () {
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                  builder: (_) => const AiSimScreen()),
+                            );
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF6366F1)
+                                  .withValues(alpha: 0.25),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Text('Steps ›',
+                                style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                    color: Color(0xFFA5B4FC))),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Serves: $_demoServeText',
+                      style: const TextStyle(
+                          fontSize: 11, color: Color(0xFFF8FAFC)),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (_demoSkipText.isNotEmpty)
+                      Text(
+                        'Skips: $_demoSkipText',
+                        style: const TextStyle(
+                            fontSize: 11, color: Color(0xFF94A3B8)),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    Text(_demoCspLine,
+                        style: const TextStyle(
+                            fontSize: 10, color: Color(0xFF94A3B8))),
+                    if (_demoLegLine.isNotEmpty)
+                      Text(_demoLegLine,
+                          style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF60A5FA))),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Container(
+                            width: 18,
+                            height: 4,
+                            decoration: BoxDecoration(
+                                color: const Color(0xFF2563EB),
+                                borderRadius: BorderRadius.circular(2))),
+                        const SizedBox(width: 4),
+                        const Text('best',
+                            style: TextStyle(
+                                fontSize: 10, color: Color(0xFF94A3B8))),
+                        const SizedBox(width: 10),
+                        Container(
+                            width: 18,
+                            height: 4,
+                            decoration: BoxDecoration(
+                                color: const Color(0xFF9CA3AF),
+                                borderRadius: BorderRadius.circular(2))),
+                        const SizedBox(width: 4),
+                        const Text('alt',
+                            style: TextStyle(
+                                fontSize: 10, color: Color(0xFF94A3B8))),
+                      ],
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -2492,10 +2993,81 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     );
   }
 
+  /// Rows for the AI assignment panel: served (struck), NEXT (highlighted),
+  /// upcoming stops of this trip's CSP plan.
+  List<Widget> _aiStopRows(BusInfo liveBus) {
+    final ordered = _assignedByTrip[liveBus.tripId] ?? [];
+    final byId = {for (final s in _stops) s.id: s};
+    final departed = _departedByTrip[liveBus.tripId] ?? {};
+    String? nextId;
+    for (final id in ordered) {
+      if (!departed.contains(id)) {
+        nextId = id;
+        break;
+      }
+    }
+    return [
+      for (final id in ordered)
+        if (byId.containsKey(id))
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: Row(
+              children: [
+                Icon(
+                  departed.contains(id)
+                      ? Icons.check_circle
+                      : (id == nextId
+                          ? Icons.navigation
+                          : Icons.radio_button_unchecked),
+                  size: 16,
+                  color: departed.contains(id)
+                      ? const Color(0xFF22C55E)
+                      : (id == nextId
+                          ? const Color(0xFFF59E0B)
+                          : const Color(0xFF64748B)),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    byId[id]!.name,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: departed.contains(id)
+                          ? const Color(0xFF64748B)
+                          : const Color(0xFFF8FAFC),
+                      decoration: departed.contains(id)
+                          ? TextDecoration.lineThrough
+                          : null,
+                    ),
+                  ),
+                ),
+                if (id == nextId)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF59E0B).withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: const Text(
+                      'NEXT',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFFF59E0B),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+    ];
+  }
+
   void _showBusDetails(BusInfo bus) {
     final liveBus = _buses[bus.tripId] ?? bus;
     final nearestStopText = _whereIsBus(liveBus);
     final routeStops = _stops.where((s) => s.routeId == liveBus.routeId).toList();
+    final hasAiPlan = _assignedByTrip.containsKey(liveBus.tripId);
 
     showModalBottomSheet(
       context: context,
@@ -2574,6 +3146,43 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                   _buildDetailRow('Live Status', _statusLabel(liveBus.runningStatus)),
                   _buildDetailRow('Bus Position', nearestStopText),
                   _buildDetailRow('Occupancy', '${liveBus.currentOccupancy}/${liveBus.capacity} (${(liveBus.occupancyPct * 100).round()}%)'),
+                  if (hasAiPlan) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF22C55E).withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: const Color(0xFF22C55E).withValues(alpha: 0.3),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.psychology,
+                                  size: 16, color: Color(0xFF22C55E)),
+                              SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  'AI: allocation optimized • live path',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFF22C55E),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          ..._aiStopRows(liveBus),
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 20),
                   SizedBox(
                     width: double.infinity,

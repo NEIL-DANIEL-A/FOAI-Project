@@ -70,6 +70,13 @@ for tbl, pk in (("bus_positions", "trip_id"), ("stop_events", "id"), ("stop_boar
     except Exception as e:  # noqa: BLE001
         check(f"table {tbl} readable", False, str(e))
 
+for tbl, pk in (("operating_slots", "id"), ("slot_buses", "slot_id"), ("stop_assignments", "id"), ("road_nodes", "id"), ("road_edges", "id")):
+    try:
+        n = sb.table(tbl).select(pk, count="exact").limit(1).execute().count
+        check(f"AI table {tbl} readable", True, f"({n} rows)")
+    except Exception as e:  # noqa: BLE001
+        check(f"AI table {tbl} readable", False, str(e))
+
 # Deep checks via direct Postgres connection (triggers + realtime publication).
 db_url = (os.getenv("DATABASE_URL") or "").strip().strip('"').strip("'")
 if db_url:
@@ -85,7 +92,7 @@ if db_url:
                 "select tablename from pg_publication_tables where pubname='supabase_realtime';"
             )
             pub = {r[0] for r in cur.fetchall()}
-            for t in ("bus_positions", "trips", "stop_events", "stops"):
+            for t in ("bus_positions", "trips", "stop_events", "stops", "operating_slots", "slot_buses", "stop_assignments"):
                 check(f"realtime enabled for {t}", t in pub)
             cur.execute("select 1 from pg_extension where extname='postgis';")
             check("postgis extension installed", cur.fetchone() is not None)

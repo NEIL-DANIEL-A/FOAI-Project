@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -8,6 +9,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'ai/astar.dart';
+import 'ai/csp.dart';
+import 'ai/demand.dart';
+import 'ai/road_graph.dart';
 
 class StopInfo {
   final String id;
@@ -15,12 +20,14 @@ class StopInfo {
   final double lat;
   final double lon;
   final int membersCount;
+  final int sequence;
   StopInfo({
     required this.id,
     required this.name,
     required this.lat,
     required this.lon,
     this.membersCount = 0,
+    this.sequence = 0,
   });
 }
 
@@ -450,6 +457,19 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
   List<StopInfo> _stops = [];
   Position? _lastPosition;
 
+  // ---- AI: CSP slot planning + A* pathfinding state ----
+  List<Map<String, dynamic>> _slots = [];
+  String? _selectedSlotId;
+  bool _planning = false;
+  String? _cspStats;
+  List<StopInfo> _myAssignedStops = [];
+  String? _nextStopId;
+  List<List<double>> _tripPathPoints = [];
+  String? _astarInfo;
+  DateTime? _lastPathCompute;
+  RealtimeChannel? _assignChannel;
+  RealtimeChannel? _slotBusChannel;
+
   @override
   void initState() {
     super.initState();
@@ -486,6 +506,9 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
           _busNumber = bus['bus_number'] as String;
           _routeId = bus['route_id'] as String;
         });
+
+        // AI: load Admin-defined operating slots (CSP candidate pools).
+        _loadSlots();
 
         // 2. Fetch if there is already an active (in_progress) trip for this driver
         final activeTrip = await _supabase
@@ -565,6 +588,12 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
         setState(() {
           _lastPosition = position;
         });
+      }
+      // AI: first fix draws the A* path; later fixes only replan on deviation.
+      if (_tripPathPoints.isEmpty && _nextStopId != null) {
+        _computePathToNext();
+      } else {
+        _maybeReplanPath(position);
       }
       if (_mapReady && _webViewController != null) {
         if (!_busMarkerAddedToMap && _busNumber != null) {
@@ -821,6 +850,8 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
           SnackBar(content: Text('$count student${count == 1 ? '' : 's'} boarded at stop')),
         );
       }
+      // AI: served one assigned stop -> advance to the next, replan A* path.
+      _advanceAfterBoarding(stopId);
     } catch (e) {
       debugPrint('Failed to submit boarding: $e');
       if (mounted) {
@@ -908,10 +939,10 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
     try {
       final data = await _supabase
           .from('stops')
-          .select('id, name, lat, lon')
+          .select('id, name, lat, lon, sequence_no')
           .eq('route_id', _routeId!)
           .order('sequence_no');
-      
+
       setState(() {
         _stops = (data as List).map((s) => StopInfo(
           id: s['id'] as String,
@@ -919,6 +950,7 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
           lat: (s['lat'] as num).toDouble(),
           lon: (s['lon'] as num).toDouble(),
           membersCount: 0,
+          sequence: (s['sequence_no'] as num?)?.toInt() ?? 0,
         )).toList();
       });
       
@@ -966,6 +998,353 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
     }
   }
 
+  // ================= AI: CSP + A* =================
+  // Same service classes the simulation replays (student_app/lib/ai/).
+
+  Future<void> _loadSlots() async {
+    if (_routeId == null) return;
+    try {
+      final data = await _supabase
+          .from('operating_slots')
+          .select('id, label, slot_time')
+          .eq('route_id', _routeId!)
+          .eq('is_active', true)
+          .order('slot_time');
+      if (!mounted) return;
+      setState(() {
+        _slots = (data as List).cast<Map<String, dynamic>>();
+        if (_selectedSlotId == null && _slots.isNotEmpty) {
+          _selectedSlotId = _slots.first['id'] as String;
+        }
+      });
+      if (_selectedSlotId != null) {
+        _loadMyAssignment();
+        _subscribeSlotChannels();
+      }
+    } catch (e) {
+      debugPrint('AI slots unavailable (tables missing?): $e');
+    }
+  }
+
+  /// Runs demand estimation + CSP + Backtracking for the selected slot and
+  /// stores the stop->bus assignment. Triggered by the driver pre-trip, or
+  /// automatically when slot availability changes (event-driven, never on
+  /// GPS updates).
+  Future<void> _runAiPlan({bool silent = false}) async {
+    if (_selectedSlotId == null || _routeId == null || _busId == null) return;
+    if (_stops.isEmpty) await _loadRouteStops();
+    if (_stops.isEmpty) return;
+    setState(() => _planning = true);
+    try {
+      // 1. Candidate pool: Admin-scheduled buses for this slot.
+      final poolRows = await _supabase
+          .from('slot_buses')
+          .select('bus_id, is_available, buses(bus_number, capacity)')
+          .eq('slot_id', _selectedSlotId!);
+
+      // 2. Demand estimation from ACTUAL historical boardings (last 14 days).
+      final since = DateTime.now().subtract(const Duration(days: 14));
+      final sinceStr = since.toIso8601String().split('T')[0];
+      final ids = _stops.map((s) => s.id).toList();
+      final boardRows = await _supabase
+          .from('stop_boardings')
+          .select('stop_id, boarding_count, recorded_at')
+          .inFilter('stop_id', ids)
+          .gte('recorded_at', sinceStr);
+      final grouped = DemandEstimationService.group(
+        (boardRows as List).cast<Map<String, dynamic>>(),
+        stopIdKey: 'stop_id',
+        countKey: 'boarding_count',
+        dateKey: 'recorded_at',
+      );
+      for (final s in _stops) {
+        grouped.putIfAbsent(s.id, () => []);
+      }
+      final estimates = DemandEstimationService.estimate(grouped, safetyFactor: 1.1);
+
+      // 3. CSP + Backtracking (same CspAssignmentService as the simulation).
+      final cspStops = _stops
+          .map((s) => CspStop(
+                id: s.id,
+                label: s.name,
+                demand: estimates[s.id]!.expected,
+                sequence: s.sequence,
+              ))
+          .toList();
+      final cspBuses = (poolRows as List).map((r) {
+        final b = r['buses'] as Map<String, dynamic>?;
+        return CspBus(
+          id: r['bus_id'] as String,
+          label: '${b?['bus_number'] ?? '?'}',
+          capacity: (b?['capacity'] as num?)?.toInt() ?? 30,
+          available: (r['is_available'] as bool?) ?? true,
+        );
+      }).toList();
+      final result = const CspAssignmentService().solve(stops: cspStops, buses: cspBuses);
+
+      if (!result.feasible || result.best == null) {
+        if (mounted && !silent) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('AI plan infeasible: demand exceeds available capacity.')),
+          );
+        }
+        setState(() => _cspStats = 'CSP infeasible (tried ${result.assignmentsTried}, backtracks ${result.backtracks})');
+        return;
+      }
+
+      // 4. Store the assignment (replaces any previous plan for this slot).
+      await _supabase.from('stop_assignments').delete().eq('slot_id', _selectedSlotId!);
+      await _supabase.from('stop_assignments').insert(
+        result.best!.assignment.entries
+            .map((e) => {'slot_id': _selectedSlotId!, 'stop_id': e.key, 'bus_id': e.value})
+            .toList(),
+      );
+
+      final totalExpected = cspStops.fold(0.0, (a, s) => a + s.demand);
+      setState(() {
+        _cspStats =
+            'CSP: ${cspStops.length} stops -> ${result.best!.busesUsed} bus(es), '
+            'expected ${totalExpected.toStringAsFixed(0)} riders '
+            '(tried ${result.assignmentsTried}, backtracks ${result.backtracks}, '
+            'score ${result.best!.score.toStringAsFixed(2)})';
+      });
+      await _loadMyAssignment();
+      if (mounted && !silent) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('AI plan ready. ${_myAssignedStops.map((s) => s.name).join(' -> ')}')),
+        );
+      }
+    } catch (e) {
+      debugPrint('AI plan failed: $e');
+      if (mounted && !silent) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('AI plan failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _planning = false);
+    }
+  }
+
+  /// Loads MY bus's assigned stops for the selected slot (ordered by route
+  /// direction). Falls back to all route stops when no AI plan exists.
+  Future<void> _loadMyAssignment() async {
+    if (_selectedSlotId == null || _busId == null) return;
+    try {
+      final rows = await _supabase
+          .from('stop_assignments')
+          .select('stop_id, bus_id')
+          .eq('slot_id', _selectedSlotId!)
+          .eq('bus_id', _busId!);
+      final myIds = <String>{for (final r in (rows as List)) r['stop_id'] as String};
+      setState(() {
+        if (myIds.isEmpty) {
+          _myAssignedStops = List.of(_stops);
+        } else {
+          _myAssignedStops = _stops.where((s) => myIds.contains(s.id)).toList();
+        }
+        if (_nextStopId == null ||
+            !_myAssignedStops.any((s) => s.id == _nextStopId)) {
+          _nextStopId = _myAssignedStops.isEmpty ? null : _myAssignedStops.first.id;
+        }
+      });
+    } catch (e) {
+      debugPrint('AI assignment load failed: $e');
+    }
+  }
+
+  /// Event channels: assignment changes (pre-trip reallocation) and bus
+  /// availability changes (auto re-plan). Never fires on GPS updates.
+  void _subscribeSlotChannels() {
+    _assignChannel?.unsubscribe();
+    _slotBusChannel?.unsubscribe();
+    if (_selectedSlotId == null) return;
+    final slotId = _selectedSlotId!;
+    _assignChannel = _supabase
+        .channel('slot-assign:$slotId')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'stop_assignments',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'slot_id',
+            value: slotId,
+          ),
+          callback: (_) async {
+            if (_isTracking) return; // live trips are never silently changed
+            await _loadMyAssignment();
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Trip assignment updated.')),
+              );
+            }
+          },
+        )
+        .subscribe();
+    _slotBusChannel = _supabase
+        .channel('slot-buses:$slotId')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.update,
+          schema: 'public',
+          table: 'slot_buses',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'slot_id',
+            value: slotId,
+          ),
+          callback: (_) async {
+            if (_isTracking || _selectedSlotId == null) return;
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Slot bus changed - re-planning stops...')),
+              );
+            }
+            await _runAiPlan(silent: true);
+          },
+        )
+        .subscribe();
+  }
+
+  void _unsubscribeSlotChannels() {
+    _assignChannel?.unsubscribe();
+    _assignChannel = null;
+    _slotBusChannel?.unsubscribe();
+    _slotBusChannel = null;
+  }
+
+  /// A* from the current GPS fix to the next assigned stop, over the road
+  /// graph built from route stops. Recomputed only on: trip start, next-stop
+  /// change, or significant deviation — never every GPS frame.
+  Future<void> _computePathToNext({bool force = false}) async {
+    if (_nextStopId == null || _lastPosition == null || _stops.isEmpty) return;
+    if (!force &&
+        _lastPathCompute != null &&
+        DateTime.now().difference(_lastPathCompute!).inSeconds < 15) {
+      return;
+    }
+    try {
+      final graph = RoadGraph.fromStops(
+        _stops.map((s) => GraphStop(id: s.id, name: s.name, lat: s.lat, lon: s.lon, sequence: s.sequence)).toList(),
+      );
+      // Temporary start node at the live GPS fix, linked to the 2 nearest stops.
+      const gpsId = 'gps:live';
+      final plat = _lastPosition!.latitude;
+      final plon = _lastPosition!.longitude;
+      graph.addNode(RoadNode(id: gpsId, label: 'Current location', lat: plat, lon: plon));
+      final byDist = _stops.toList()
+        ..sort((a, b) => RoadGraph.haversineM(plat, plon, a.lat, a.lon)
+            .compareTo(RoadGraph.haversineM(plat, plon, b.lat, b.lon)));
+      for (var i = 0; i < (byDist.length < 2 ? byDist.length : 2); i++) {
+        final s = byDist[i];
+        final dM = RoadGraph.haversineM(plat, plon, s.lat, s.lon);
+        graph.addUndirectedEdge(
+          id: 'gps-link:$i',
+          a: gpsId,
+          b: 'stop:${s.id}',
+          cost: dM / 8.0,
+          distanceM: dM,
+        );
+      }
+      final res = const AStarService()
+          .findPath(graph, gpsId, 'stop:$_nextStopId', recordTrace: false);
+      _lastPathCompute = DateTime.now();
+      if (!res.found) {
+        setState(() => _astarInfo = 'A*: no road path to next stop');
+        return;
+      }
+      final pts = <List<double>>[];
+      final labels = <String>[];
+      for (final id in res.path) {
+        final n = graph.nodes[id]!;
+        pts.add([n.lat, n.lon]);
+        if (id != gpsId) labels.add(n.label);
+      }
+      final next = _stops.firstWhere((s) => s.id == _nextStopId);
+      setState(() {
+        _tripPathPoints = pts;
+        final km = res.cost * 8.0 / 1000.0;
+        final mins = res.cost / 60.0;
+        _astarInfo =
+            'A* to ${next.name}: ${km.toStringAsFixed(1)} km, ~${mins.toStringAsFixed(0)} min '
+            '(${res.nodesExpanded} nodes explored)';
+      });
+      _drawTripPath();
+    } catch (e) {
+      debugPrint('A* path failed: $e');
+    }
+  }
+
+  void _drawTripPath() {
+    if (_tripPathPoints.length < 2) return;
+    _sendToMap(
+        '{"type":"drawPath","id":"trip-path","points":[${_tripPathPoints.map((p) => '[${p[0]},${p[1]}]').join(',')}]}');
+  }
+
+  /// Deviation guard called from the GPS stream: replan only when the bus
+  /// has actually left the planned corridor (>150 m) — throttled inside
+  /// [_computePathToNext].
+  void _maybeReplanPath(Position position) {
+    if (!_isTracking || _tripPathPoints.length < 2) return;
+    var best = double.infinity;
+    for (var i = 0; i < _tripPathPoints.length - 1; i++) {
+      final d = _distToSegmentM(
+        position.latitude,
+        position.longitude,
+        _tripPathPoints[i][0],
+        _tripPathPoints[i][1],
+        _tripPathPoints[i + 1][0],
+        _tripPathPoints[i + 1][1],
+      );
+      if (d < best) best = d;
+    }
+    if (best > 150) {
+      debugPrint('A*: deviation ${best.toStringAsFixed(0)} m - replanning');
+      _computePathToNext(force: true);
+    }
+  }
+
+  double _distToSegmentM(double plat, double plon, double alat, double alon, double blat, double blon) {
+    // Equirectangular projection is plenty accurate at these scales.
+    const r = 6371000.0;
+    const k = 3.141592653589793 / 180.0;
+    final mx = (alon + blon) / 2 * k;
+    double x(double lon) => lon * k * r * math.cos(mx);
+    double y(double lat) => lat * k * r;
+    final px = x(plon), py = y(plat);
+    final ax = x(alon), ay = y(alat);
+    final bx = x(blon), by = y(blat);
+    final dx = bx - ax, dy = by - ay;
+    final len2 = dx * dx + dy * dy;
+    var t = len2 == 0 ? 0.0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = t.clamp(0.0, 1.0);
+    final cx = ax + t * dx, cy = ay + t * dy;
+    return math.sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+  }
+
+  /// After a boarding is recorded, advance to the next ASSIGNED stop
+  /// (skipped stops are simply never visited) and recompute the A* path.
+  void _advanceAfterBoarding(String stopId) {
+    if (_myAssignedStops.isEmpty) return;
+    final idx = _myAssignedStops.indexWhere((s) => s.id == stopId);
+    final nextIdx = idx == -1 ? 0 : idx + 1;
+    setState(() {
+      if (nextIdx < _myAssignedStops.length) {
+        _nextStopId = _myAssignedStops[nextIdx].id;
+      } else {
+        _nextStopId = null; // terminus reached
+        _tripPathPoints = [];
+        _astarInfo = 'Terminus reached - all assigned stops served';
+      }
+    });
+    if (_nextStopId != null) _computePathToNext(force: true);
+  }
+
+  String _nextStopName() {
+    for (final s in _myAssignedStops) {
+      if (s.id == _nextStopId) return s.name;
+    }
+    return _nextStopId == null ? 'terminus reached' : '…';
+  }
+
   Future<void> _startTrip() async {
     if (_busId == null || _routeId == null) return;
 
@@ -974,11 +1353,12 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
       final user = _supabase.auth.currentUser;
       if (user == null) return;
 
-      // 1. Create a trip record
+      // 1. Create a trip record (linked to its operating slot for AI assignments)
       final response = await _supabase.from('trips').insert({
         'bus_id': _busId,
         'driver_id': user.id,
         'route_id': _routeId,
+        'slot_id': _selectedSlotId,
         'trip_date': DateTime.now().toIso8601String().split('T')[0],
         'status': 'in_progress',
         'started_at': DateTime.now().toIso8601String(),
@@ -994,6 +1374,10 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
 
       _initWebView();
       _loadRouteStops();
+
+      // AI: reload this trip's assignment, watch for pre-trip updates.
+      await _loadMyAssignment();
+      _subscribeSlotChannels();
 
       // 2. Activate background geolocation stream
       await _startLocationUpdates();
@@ -1033,6 +1417,7 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
 
       // 3. Unsubscribe from arrival events
       _unsubscribeFromArrivals();
+      _unsubscribeSlotChannels();
 
       setState(() {
         _activeTripId = null;
@@ -1042,6 +1427,11 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
         _webViewController = null;
         _stops.clear();
         _lastPosition = null;
+        _myAssignedStops = [];
+        _nextStopId = null;
+        _tripPathPoints = [];
+        _astarInfo = null;
+        _cspStats = null;
       });
 
       if (mounted) {
@@ -1064,6 +1454,7 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
   void dispose() {
     _positionSubscription?.cancel();
     _arrivalChannel?.unsubscribe();
+    _unsubscribeSlotChannels();
     super.dispose();
   }
 
@@ -1136,6 +1527,89 @@ class _TripDashboardScreenState extends State<TripDashboardScreen> {
                                   fontWeight: FontWeight.bold,
                                 ),
                           ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  // ---- AI planning panel (CSP slot plan + A* path) ----
+                  Card(
+                    color: const Color(0xFF1E1E1E),
+                    child: Padding(
+                      padding: const EdgeInsets.all(12.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(Icons.psychology,
+                                  size: 18, color: Color(0xFF22C55E)),
+                              const SizedBox(width: 6),
+                              const Text('AI Slot Plan',
+                                  style: TextStyle(fontWeight: FontWeight.bold)),
+                              const Spacer(),
+                              if (!_isTracking && _slots.isNotEmpty)
+                                DropdownButton<String>(
+                                  value: _selectedSlotId,
+                                  dropdownColor: const Color(0xFF1E1E1E),
+                                  items: _slots
+                                      .map((s) => DropdownMenuItem<String>(
+                                            value: s['id'] as String,
+                                            child: Text('${s['label']}',
+                                                style: const TextStyle(fontSize: 13)),
+                                          ))
+                                      .toList(),
+                                  onChanged: (v) {
+                                    setState(() => _selectedSlotId = v);
+                                    _loadMyAssignment();
+                                    _subscribeSlotChannels();
+                                  },
+                                ),
+                            ],
+                          ),
+                          if (!_isTracking) ...[
+                            const SizedBox(height: 8),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                onPressed: (_planning ||
+                                        _selectedSlotId == null ||
+                                        _stops.isEmpty)
+                                    ? null
+                                    : () => _runAiPlan(),
+                                icon: _planning
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(strokeWidth: 2))
+                                    : const Icon(Icons.auto_awesome, size: 16),
+                                label: Text(_planning ? 'Planning...' : 'AI Plan Stops (CSP)'),
+                              ),
+                            ),
+                          ],
+                          if (_cspStats != null) ...[
+                            const SizedBox(height: 4),
+                            Text(_cspStats!,
+                                style: const TextStyle(
+                                    fontSize: 11, color: Color(0xFF94A3B8))),
+                          ],
+                          if (_myAssignedStops.isNotEmpty) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              _isTracking
+                                  ? 'Next: ${_nextStopName()}'
+                                  : 'Your stops: ${_myAssignedStops.map((s) => s.name).join(' → ')}',
+                              style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF22C55E),
+                                  fontWeight: FontWeight.w600),
+                            ),
+                          ],
+                          if (_astarInfo != null && _isTracking) ...[
+                            const SizedBox(height: 2),
+                            Text(_astarInfo!,
+                                style: const TextStyle(
+                                    fontSize: 11, color: Color(0xFF94A3B8))),
+                          ],
                         ],
                       ),
                     ),

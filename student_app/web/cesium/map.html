@@ -36,6 +36,7 @@
         var viewer = null;
         var busEntities = {};
         var stopEntities = {};
+        var pathEntities = {};
         var trackedBusId = null;
         var initToken = '';
         var initAttempted = false;
@@ -418,6 +419,45 @@
             });
         }
 
+        // AI: route overlay, Google-Maps style. points = [[lat, lon], ...].
+        // color/width optional: best route blue+thick, alternatives gray+thin.
+        function drawPath(id, points, color, width) {
+            if (!viewer) return;
+            clearPath(id);
+            if (!points || points.length < 2) return;
+            var positions = [];
+            for (var i = 0; i < points.length; i++) {
+                positions.push(Cesium.Cartesian3.fromDegrees(points[i][1], points[i][0]));
+            }
+            var entity = viewer.entities.add({
+                id: 'path:' + id,
+                polyline: {
+                    positions: positions,
+                    width: width || 5,
+                    clampToGround: true,
+                    material: Cesium.Color.fromCssColorString(color || '#22C55E')
+                }
+            });
+            pathEntities[id] = entity;
+            viewer.scene.requestRender();
+        }
+
+        function clearPath(id) {
+            if (!viewer) return;
+            if (id) {
+                if (pathEntities[id]) {
+                    try { viewer.entities.remove(pathEntities[id]); } catch(e) {}
+                    delete pathEntities[id];
+                }
+            } else {
+                for (var k in pathEntities) {
+                    try { viewer.entities.remove(pathEntities[k]); } catch(e) {}
+                }
+                pathEntities = {};
+            }
+            viewer.scene.requestRender();
+        }
+
         async function handleMessage(msg) {
             if (typeof msg === 'string') {
                 try { msg = JSON.parse(msg); } catch(e) { return; }
@@ -430,6 +470,8 @@
                 case 'removeBus': removeBusMarker(msg.id); break;
                 case 'addStop': addStopMarker(msg.id, msg.lat, msg.lon, msg.name, msg.membersCount); break;
                 case 'removeStop': removeStopMarker(msg.id); break;
+                case 'drawPath': drawPath(msg.id, msg.points, msg.color, msg.width); break;
+                case 'clearPath': clearPath(msg.id); break;
                 case 'flyToBus': flyToBus(msg.id); break;
                 case 'flyToLocation': flyToLocation(msg.lat, msg.lon); break;
                 case 'trackBus': trackedBusId = msg.id; flyToBus(msg.id); break;
