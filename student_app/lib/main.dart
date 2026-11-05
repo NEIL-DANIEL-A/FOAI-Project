@@ -1177,6 +1177,67 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
   String _demoLegLine = '';
   final Map<String, List<List<double>>> _demoGeoCache = {};
 
+  /// Road-snapped polyline for every leg (stop i → stop i+1). The bus marker
+  /// travels along this geometry so it hugs the road through turns instead of
+  /// cutting across land on a straight stop-to-stop line. Null till loaded /
+  /// when OSRM is unreachable (falls back to straight-line lerp).
+  List<List<List<double>>>? _demoLegPaths;
+
+  /// Point at fraction [f] (0..1) along a polyline by arc length, so the
+  /// marker's speed stays even even if the road polyline has uneven spacing.
+  List<double> _pointAlongPolyline(List<List<double>> path, double f) {
+    if (path.isEmpty) return [0, 0];
+    if (path.length == 1) return path.first;
+    var total = 0.0;
+    for (var i = 1; i < path.length; i++) {
+      total += RoadGraph.haversineM(
+          path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]);
+    }
+    if (total <= 0) return path.last;
+    var target = f.clamp(0.0, 1.0) * total;
+    for (var i = 1; i < path.length; i++) {
+      final seg = RoadGraph.haversineM(
+          path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]);
+      if (seg <= 0) continue;
+      if (target <= seg || i == path.length - 1) {
+        final t = (target / seg).clamp(0.0, 1.0);
+        return [
+          _lerp(path[i - 1][0], path[i][0], t),
+          _lerp(path[i - 1][1], path[i][1], t),
+        ];
+      }
+      target -= seg;
+    }
+    return path.last;
+  }
+
+  /// Pre-fetches the road-following polyline for each stop-to-stop leg so the
+  /// demo bus can drive the actual route shape (corners included).
+  Future<void> _loadDemoLegPaths() async {
+    if (_demoStops.length < 2) return;
+    final paths = <List<List<double>>>[];
+    for (var i = 0; i < _demoStops.length - 1; i++) {
+      if (!_demoActive) return;
+      final a = _demoStops[i];
+      final b = _demoStops[i + 1];
+      final straight = [
+        [a.lat, a.lon],
+        [b.lat, b.lon],
+      ];
+      final geo = await _demoGeometry('leg:$_demoRouteId:$i:${a.id}:${b.id}', straight);
+      paths.add(geo.length >= 2 ? geo : straight);
+    }
+    if (!_demoActive) return;
+    _demoLegPaths = paths;
+    if (mounted) {
+      setState(() {});
+      // Re-place at the current step so the marker snaps onto the road, and
+      // keep the drawn best/alt overlay consistent with the new geometry.
+      _placeDemoBus();
+      _refreshDemoRouteOverlay();
+    }
+  }
+
   /// Runs CSP for the picked bus's slot. Returns the stops THIS bus serves
   /// (ordered); the rest are shown as skips in the overlay card.
   Future<List<StopInfo>> _prepareDemoCsp({
@@ -1447,6 +1508,8 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     _placeDemoBus();
     // Bring the map to the demo route even if it was looking elsewhere.
     _sendToMap(_enc({'type': 'flyToBus', 'id': 'demo-trip'}));
+    _demoLegPaths = null;
+    _loadDemoLegPaths();
     _demoTimer = Timer.periodic(const Duration(seconds: 2), (_) => _demoTick());
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1459,7 +1522,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     }
     // Opening arrival right away so the full flow shows within seconds.
     _showArrivalAlert(_demoBusNumber, _demoStops.first.name);
-    _showDemoHeadcountDialog(_demoStops.first.name);
+    if (_demoOccupancy < _demoCapacity) _showDemoHeadcountDialog(_demoStops.first.name);
   }
 
   void _stopDemo() {
@@ -1491,6 +1554,12 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     }
     final leg = s ~/ _demoStepsPerLeg;
     final f = (s % _demoStepsPerLeg) / _demoStepsPerLeg;
+    final legPaths = _demoLegPaths;
+    if (legPaths != null && leg < legPaths.length && legPaths[leg].length >= 2) {
+      // Ride the road geometry for this leg: the marker stays on the street
+      // even through sharp turns.
+      return _pointAlongPolyline(legPaths[leg], f);
+    }
     final a = _demoStops[leg];
     final b = _demoStops[leg + 1];
     return [_lerp(a.lat, b.lat, f), _lerp(a.lon, b.lon, f)];
@@ -1540,7 +1609,15 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       _demoStatus = 'arrived';
       _placeDemoBus();
       _showArrivalAlert(_demoBusNumber, stopName);
-      _showDemoHeadcountDialog(stopName);
+      if (_demoOccupancy < _demoCapacity) {
+        _showDemoHeadcountDialog(stopName);
+      } else {
+        // Bus is at capacity - no boarding prompt: depart immediately and
+        // advance the route like a dialog dismissal would.
+        _demoStatus = 'on_time';
+        _demoTargetIdx = (_demoTargetIdx + 1).clamp(0, _demoStops.length - 1);
+        _refreshDemoRouteOverlay();
+      }
     } else {
       _demoStatus = 'on_time';
       _placeDemoBus();
@@ -1554,8 +1631,10 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     void append(String d) {
       if (controller.text == '0') {
         controller.text = d;
-      } else {
+      } else if (controller.text.length < 3) {
         controller.text += d;
+      } else {
+        controller.text = d;
       }
     }
 
@@ -1571,94 +1650,192 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
       context: context,
       barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          backgroundColor: const Color(0xFF1E1E1E),
-          title: Text('Driver: boarding at $stopName'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                'How many students boarded? (students see this live)',
-                style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: controller,
-                readOnly: true,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold),
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
-                  contentPadding: EdgeInsets.symmetric(vertical: 12),
+        builder: (ctx, setDialogState) {
+          final count = int.tryParse(controller.text) ?? 0;
+          final remaining = _demoCapacity - _demoOccupancy;
+          final overFull = count > remaining;
+          final submitColor = overFull ? const Color(0xFFEF4444) : const Color(0xFF22C55E);
+
+          Widget key(String label, VoidCallback onTap, {Color? fg}) {
+            return SizedBox(
+              height: 46,
+              child: Material(
+                color: const Color(0xFF2C2C2C),
+                borderRadius: BorderRadius.circular(10),
+                child: InkWell(
+                  onTap: onTap,
+                  borderRadius: BorderRadius.circular(10),
+                  child: Center(
+                    child: Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                        color: fg ?? Colors.white,
+                      ),
+                    ),
+                  ),
                 ),
               ),
-              const SizedBox(height: 12),
-              SizedBox(
-                height: 200,
-                width: 240,
-                child: GridView.builder(
-                  physics: const NeverScrollableScrollPhysics(),
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 3,
-                    mainAxisSpacing: 6,
-                    crossAxisSpacing: 6,
+            );
+          }
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E1E1E),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+            titlePadding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
+            contentPadding: const EdgeInsets.fromLTRB(20, 10, 20, 4),
+            actionsPadding: const EdgeInsets.fromLTRB(16, 2, 16, 12),
+            title: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF6366F1).withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(8),
                   ),
-                  itemCount: 12,
-                  itemBuilder: (ctx, i) {
-                    if (i < 9) {
-                      final num = '${i + 1}';
-                      return _demoNumpadKey(num, () {
-                        append(num);
-                        setDialogState(() {});
-                      });
-                    } else if (i == 9) {
-                      return _demoNumpadKey('0', () {
-                        append('0');
-                        setDialogState(() {});
-                      });
-                    } else if (i == 10) {
-                      return _demoNumpadKey('⌫', () {
-                        backspace();
-                        setDialogState(() {});
-                      });
-                    }
-                    return _demoNumpadKey('C', () {
-                      controller.text = '0';
-                      setDialogState(() {});
-                    });
-                  },
+                  child: const Icon(Icons.groups, size: 18, color: Color(0xFF818CF8)),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Boarding at $stopName',
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Driver demo: how many students boarded?',
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                  ),
+                  const SizedBox(height: 10),
+                  // Seats summary strip.
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      _demoSeatChip('Onboard', '$_demoOccupancy', const Color(0xFF60A5FA)),
+                      const SizedBox(width: 6),
+                      _demoSeatChip('Capacity', '$_demoCapacity', const Color(0xFF94A3B8)),
+                      const SizedBox(width: 6),
+                      _demoSeatChip('Free', '$remaining', const Color(0xFF4ADE80)),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  // Big readout.
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF2C2C2C),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: overFull ? const Color(0xFFEF4444) : const Color(0xFF3F3F3F),
+                        width: overFull ? 1.5 : 1,
+                      ),
+                    ),
+                    child: Text(
+                      controller.text,
+                      style: TextStyle(
+                        fontSize: 34,
+                        fontWeight: FontWeight.w800,
+                        color: overFull ? const Color(0xFFEF4444) : Colors.white,
+                      ),
+                    ),
+                  ),
+                  if (overFull)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        'Only $remaining seat${remaining == 1 ? '' : 's'} left on this bus',
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFFF87171)),
+                      ),
+                    ),
+                  const SizedBox(height: 10),
+                  // Numpad: plain Rows (NOT a GridView). GridView is a lazy
+                  // viewport which can't answer AlertDialog's intrinsic-size
+                  // query - that assertion made the whole dialog fail to
+                  // paint (dim barrier, no popup). Rows size intrinsically,
+                  // auto-fit the dialog and can never clip a row.
+                  for (final row in const [
+                    ['1', '2', '3'],
+                    ['4', '5', '6'],
+                    ['7', '8', '9'],
+                    ['C', '0', '⌫'],
+                  ])
+                    Row(
+                      children: [
+                        for (final label in row)
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.all(3),
+                              child: key(
+                                label,
+                                () {
+                                  if (label == '⌫') {
+                                    backspace();
+                                  } else if (label == 'C') {
+                                    controller.text = '0';
+                                  } else {
+                                    append(label);
+                                  }
+                                  setDialogState(() {});
+                                },
+                                fg: label == '⌫'
+                                    ? const Color(0xFFF59E0B)
+                                    : label == 'C'
+                                        ? const Color(0xFFE5E7EB)
+                                        : null,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Skip', style: TextStyle(color: Color(0xFF94A3B8))),
+              ),
+              ElevatedButton.icon(
+                onPressed: () {
+                  final value = int.tryParse(controller.text) ?? 0;
+                  Navigator.pop(ctx);
+                  _demoOccupancy = (_demoOccupancy + value).clamp(0, _demoCapacity);
+                  _demoStatus = 'on_time';
+                  _placeDemoBus();
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          '$value boarded - bus $_demoBusNumber now $_demoOccupancy/$_demoCapacity',
+                        ),
+                        backgroundColor: const Color(0xFF22C55E),
+                        duration: const Duration(seconds: 3),
+                      ),
+                    );
+                  }
+                },
+                icon: const Icon(Icons.check_rounded, size: 18),
+                label: const Text('Submit'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: submitColor,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                 ),
               ),
             ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Skip'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                final count = int.tryParse(controller.text) ?? 0;
-                Navigator.pop(ctx);
-                _demoOccupancy = (_demoOccupancy + count).clamp(0, _demoCapacity);
-                _demoStatus = 'on_time';
-                _placeDemoBus();
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text(
-                        '$count boarded - bus $_demoBusNumber now $_demoOccupancy/$_demoCapacity',
-                      ),
-                      backgroundColor: const Color(0xFF22C55E),
-                      duration: const Duration(seconds: 3),
-                    ),
-                  );
-                }
-              },
-              child: const Text('Submit'),
-            ),
-          ],
-        ),
+          );
+        },
       ),
     ).then((_) {
       controller.dispose();
@@ -1672,15 +1849,21 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
     });
   }
 
-  Widget _demoNumpadKey(String label, VoidCallback onTap) {
-    return ElevatedButton(
-      onPressed: onTap,
-      style: ElevatedButton.styleFrom(
-        backgroundColor: const Color(0xFF2C2C2C),
-        foregroundColor: Colors.white,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+  Widget _demoSeatChip(String label, String value, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(10),
       ),
-      child: Text(label, style: const TextStyle(fontSize: 20)),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(label, style: TextStyle(fontSize: 10, color: color.withValues(alpha: 0.9))),
+          const SizedBox(width: 4),
+          Text(value, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800, color: color)),
+        ],
+      ),
     );
   }
 
@@ -2426,7 +2609,9 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
 
           // Locate me button (bottom-right, above bus list)
           Positioned(
-            bottom: _buses.isNotEmpty ? 140 : 24,
+            bottom: _buses.isNotEmpty
+                ? 140 + MediaQuery.of(context).padding.bottom
+                : 24 + MediaQuery.of(context).padding.bottom,
             right: 16,
             child: GestureDetector(
               onTap: _locateMe,
@@ -2640,7 +2825,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
           // Stop demo button
           if (_demoActive)
             Positioned(
-              bottom: 150,
+              bottom: 150 + MediaQuery.of(context).padding.bottom,
               left: 16,
               child: GestureDetector(
                 onTap: _stopDemo,
@@ -2672,7 +2857,9 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
           // Stop tracking button (shown when tracking a bus)
           if (_trackingTripId != null)
             Positioned(
-              bottom: _buses.isNotEmpty ? 140 : 24,
+              bottom: _buses.isNotEmpty
+                  ? 140 + MediaQuery.of(context).padding.bottom
+                  : 24 + MediaQuery.of(context).padding.bottom,
               left: 16,
               child: GestureDetector(
                 onTap: _stopTracking,
@@ -2764,7 +2951,8 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
               left: 0,
               right: 0,
               child: Container(
-                height: 140,
+                height: 140 + MediaQuery.of(context).padding.bottom,
+                padding: EdgeInsets.only(bottom: MediaQuery.of(context).padding.bottom),
                 decoration: BoxDecoration(
                   color: const Color(0xFF0F172A).withValues(alpha: 0.97),
                   borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
@@ -2783,7 +2971,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
                       child: Row(
                         children: [
                           Container(
@@ -2811,7 +2999,7 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                     Expanded(
                       child: ListView.separated(
                         scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
                         itemCount: _buses.length,
                         separatorBuilder: (_, __) => const SizedBox(width: 10),
                         itemBuilder: (ctx, i) {
@@ -2898,6 +3086,8 @@ class _LiveMapScreenState extends State<LiveMapScreen> {
                                       fontWeight: FontWeight.w500,
                                       color: _busColor(b.runningStatus).withValues(alpha: 0.8),
                                     ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                   ),
                                   const Spacer(),
                                   Row(
